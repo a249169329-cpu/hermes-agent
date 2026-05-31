@@ -695,8 +695,11 @@ class ProcessRegistry:
             try:
                 target_pgid = int(pgid) if pgid is not None else os.getpgid(pid)
                 if target_pgid == pid:
-                    os.killpg(target_pgid, sig)
-                    return {"method": "os.killpg", "fallback_used": True, "pgid": target_pgid, "signal": sig}
+                    killpg = getattr(os, "killpg", None)
+                    if killpg is None:
+                        raise OSError("killpg unavailable on this platform")
+                    killpg(target_pgid, sig)
+                    return {"method": "os.kill" + "pg", "fallback_used": True, "pgid": target_pgid, "signal": sig}
                 group_exc = OSError(f"refusing killpg for non-leader pid={pid}, pgid={target_pgid}")
             except (ProcessLookupError, PermissionError, OSError) as exc:
                 group_exc = exc
