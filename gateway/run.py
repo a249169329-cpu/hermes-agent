@@ -1944,7 +1944,7 @@ def _messages_to_persist_after_agent_run(
         entry = {"role": "user", "content": message_text, "timestamp": timestamp}
         if platform_message_id:
             entry["message_id"] = str(platform_message_id)
-        return [entry], False
+        return [entry], bool(session_db_available)
 
     history_len = agent_result.get("history_offset", 0)
     if not isinstance(history_len, int) or history_len < 0:
@@ -1954,7 +1954,7 @@ def _messages_to_persist_after_agent_run(
         entry = {"role": "user", "content": message_text, "timestamp": timestamp}
         if platform_message_id:
             entry["message_id"] = str(platform_message_id)
-        return [entry], False
+        return [entry], bool(session_db_available)
 
     def _is_compaction_summary_content(content: Any) -> bool:
         if not isinstance(content, str):
@@ -8813,6 +8813,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                 )
             elif agent_failed_early:
+                logger.info(
+                    "Transient agent failure in session %s — persisting user "
+                    "message so conversation context is preserved on retry.",
+                    session_entry.session_id,
+                )
+
+            # When compression is exhausted, the session is permanently too
+            # large to process.  Auto-reset it so the next message starts
+            # fresh instead of replaying the same oversized context in an
+            # infinite fail loop.  (#9893)
+            if agent_result.get("compression_exhausted") and session_entry and session_key:
+                logger.info(
+                    "Auto-resetting session %s after compression exhaustion.",
+                    session_entry.session_id,
+                )
+                self.session_store.reset_session(session_key)
+                self._evict_cached_agent(session_key)
+                self._session_model_overrides.pop(session_key, None)
+                self._set_session_reasoning_override(session_key, None)
+                if hasattr(self, "_pending_model_notes"):
+                    self._pending_model_notes.pop(session_key, None)
+                response = (response or "") + (
+                    "\n\n🔄 Session auto-reset — the conversation exceeded the "
+                    "maximum context size and could not be compressed further. "
+                    "Your next message will start a fresh session."
+                )
+
+            ts = datetime.now().isoformat()
+            
+            # If this is a fresh session (no history), write the full tool
+            # definitions as the first entry so the transcript is self-describing
+            # -- the same list of dicts sent as tools=[...] in the API request.
+            if is_context_overflow_failure:
+                pass  # Skip all transcript writes — don't grow a broken session
+            elif not history:
+                tool_defs = agent_result.get("tools", [])
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {
+                        "role": "session_meta",
+                        "tools": tool_defs or [],
+                        "model": _resolve_gateway_model(),
+                        "platform": source.platform.value if source.platform else "",
+                        "timestamp": ts,
+                    }
+                )
+            
+            # The agent already persisted these messages to SQLite via
+            # _flush_messages_to_session_db(), so skip the DB write here
+            # to prevent the duplicate-write bug (#860 / #42039).  We still
+            # write to JSONL for backward compatibility and as a backup.
+            agent_persisted = self._session_db is not None
+
+            # Find only the NEW messages from this turn (skip history we loaded).
+            # Use the filtered history length (history_offset) that was actually
+            # passed to the agent, not len(history) which includes session_meta
+            # entries that were stripped before the agent saw them.
+            if is_context_overflow_failure:
+                pass  # handled above — skip all transcript writes
+            elif agent_failed_early:
                 # Transient failure (429/timeout/5xx): persist the user's
                 # message so the next message can load a transcript that
                 # reflects what was said.  Skip the assistant error text since
@@ -8831,7 +8891,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text=message_text,
                     timestamp=ts,
                     platform_message_id=event.message_id,
-                    session_db_available=self._session_db is not None,
+                    session_db_available=agent_persisted,
                 )
                 for _row in _rows_to_persist:
                     self.session_store.append_to_transcript(
@@ -8873,7 +8933,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             message_text=message_text,
                             timestamp=ts,
                             platform_message_id=event.message_id,
-                            session_db_available=self._session_db is not None,
+                            session_db_available=agent_persisted,
                         )
                         for _row in _rows_to_persist:
                             self.session_store.append_to_transcript(
@@ -8905,7 +8965,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_entry.session_id, entry,
                                 skip_db=agent_persisted,
                             )
-            
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
             # compression decisions.
