@@ -1339,6 +1339,9 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
+    compression_wall_clock_cap_seconds = _compression_cfg.get(
+        "wall_clock_cap_seconds", 0
+    )
 
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
@@ -1556,6 +1559,7 @@ def init_agent(
             provider=agent.provider,
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
+            wall_clock_cap_seconds=compression_wall_clock_cap_seconds,
         )
     agent.compression_enabled = compression_enabled
     agent.compression_soft_request_limit = compression_soft_request_limit
