@@ -523,6 +523,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
+    prompt_cache_key TEXT,
+    prompt_cache_supported INTEGER,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
@@ -1299,6 +1301,8 @@ class SessionDB:
         model: str = None,
         model_config: Dict[str, Any] = None,
         system_prompt: str = None,
+        prompt_cache_key: str = None,
+        prompt_cache_supported: Optional[bool] = None,
         user_id: str = None,
         user_id_alt: str = None,
         chat_type: str = None,
@@ -1313,8 +1317,9 @@ class SessionDB:
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, user_id_alt,
                    chat_type, chat_id, thread_id, session_key, model, model_config,
-                   system_prompt, parent_session_id, cwd, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, prompt_cache_key, prompt_cache_supported,
+                   parent_session_id, cwd, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -1327,6 +1332,8 @@ class SessionDB:
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
+                    prompt_cache_key,
+                    None if prompt_cache_supported is None else int(bool(prompt_cache_supported)),
                     parent_session_id,
                     cwd,
                     time.time(),
@@ -1541,6 +1548,53 @@ class SessionDB:
                 (model, session_id),
             )
         self._execute_write(_do)
+
+    def update_prompt_cache_state(
+        self,
+        session_id: str,
+        *,
+        prompt_cache_key: Optional[str] = None,
+        prompt_cache_supported: Optional[bool] = None,
+    ) -> bool:
+        """Persist prompt-cache metadata for a session.
+
+        Returns True when a row was updated, False when the session does not
+        exist.
+        """
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE sessions SET prompt_cache_key = ?, prompt_cache_supported = ? WHERE id = ?",
+                (
+                    prompt_cache_key,
+                    None if prompt_cache_supported is None else int(bool(prompt_cache_supported)),
+                    session_id,
+                ),
+            )
+            return cur.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
+    def get_prompt_cache_state(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return prompt-cache metadata for a session, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT prompt_cache_key, prompt_cache_supported FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        prompt_cache_key = row["prompt_cache_key"] if isinstance(row, sqlite3.Row) else row[0]
+        prompt_cache_supported = row["prompt_cache_supported"] if isinstance(row, sqlite3.Row) else row[1]
+        if prompt_cache_key is None and prompt_cache_supported is None:
+            return None
+        if prompt_cache_supported is None:
+            supported_value = None
+        else:
+            supported_value = bool(prompt_cache_supported)
+        return {
+            "prompt_cache_key": prompt_cache_key,
+            "prompt_cache_supported": supported_value,
+        }
 
     def update_token_counts(
         self,
