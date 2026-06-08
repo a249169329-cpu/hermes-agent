@@ -3,12 +3,33 @@
 import tools.terminal_tool as terminal_tool
 
 
+def _reset_gateway_session_key_context():
+    """Restore CLI-style os.environ fallback for terminal-tool unit tests.
+
+    Some earlier gateway tests call clear_session_vars(), which intentionally
+    leaves HERMES_SESSION_KEY's ContextVar set to an explicit empty string so
+    production gateway code does not fall back to stale os.environ values. These
+    terminal tests exercise the CLI/env fallback path, so reset only the session
+    key ContextVar to the never-set sentinel between tests.
+    """
+    try:
+        from gateway.session_context import _UNSET, _VAR_MAP
+    except Exception:
+        return
+
+    session_key_var = _VAR_MAP.get("HERMES_SESSION_KEY")
+    if session_key_var is not None:
+        session_key_var.set(_UNSET)
+
+
 def setup_function():
+    _reset_gateway_session_key_context()
     terminal_tool._reset_cached_sudo_passwords()
 
 
 def teardown_function():
     terminal_tool._reset_cached_sudo_passwords()
+    _reset_gateway_session_key_context()
 
 
 def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):
