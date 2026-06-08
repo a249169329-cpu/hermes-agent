@@ -276,6 +276,27 @@ def _base_terminal_config(tmp_path):
     }
 
 
+def test_terminal_description_routes_codex_implementation_to_staged_tool():
+    description = terminal_tool.TERMINAL_TOOL_DESCRIPTION
+
+    assert "codex_staged_implement" in description
+    assert "Do NOT call raw `codex-yuna exec`" in description
+    assert "codex_stage_runner.py" in description
+    assert "codex_impl_guard.py" in description
+    assert "codex_review_guard.py" in description
+
+
+def test_codex_review_subcommand_guard_accepts_json_schema_and_last_message():
+    command = (
+        "codex-yuna exec review --uncommitted --json "
+        "--output-schema /tmp/codex_review_schema.json "
+        "--output-last-message /tmp/codex_review_final.json "
+        "'review current changes'"
+    )
+
+    assert terminal_tool._codex_review_launch_error(command) is None
+
+
 def test_codex_exec_detection_handles_paths_and_env_prefixes():
     commands = [
         "codex-yuna exec fix tests",
@@ -320,6 +341,114 @@ def test_codex_help_and_version_are_harmless():
         assert info["is_harmless"], command
         assert not info["is_codex_exec"], command
 
+
+def test_bare_codex_impl_launch_is_blocked_even_in_background():
+    commands = (
+        "codex-yuna exec --full-auto 'implement the change'",
+        "codex exec 'implement the change'",
+        "env FOO=bar codex-yuna exec 'implement the change'",
+        "bash -lc 'codex-yuna exec implement the change'",
+        "codex-yuna exec --full-auto 'review and implement the change'",
+        "codex exec 'review the code then fix it'",
+        "codex-yuna exec review and implement the change",
+        "codex exec review then fix it",
+        "codex-yuna exec review and implement the change --json --output-schema /tmp/schema --output-last-message /tmp/final",
+        "codex-yuna exec --full-auto review and implement --json --output-schema /tmp/schema --output-last-message /tmp/final",
+        "codex-yuna exec review --sandbox read-only --json --output-schema /tmp/schema --output-last-message /tmp/final 'review then fix it'",
+    )
+
+    for command in commands:
+        error = terminal_tool._codex_unguarded_impl_launch_error(command)
+
+        assert error is not None
+        assert "unguarded Codex implementation" in error
+        assert "codex_staged_implement" in error
+        assert "allowed_files" in error
+        assert "allowed_globs" in error
+        assert "codex_stage_runner.py" in error
+        assert "codex_impl_guard.py" in error
+        assert "codex_review_guard.py" in error
+
+
+def test_bare_read_only_codex_review_launch_is_not_blocked_as_impl():
+    commands = (
+        "codex-yuna exec --sandbox read-only --json --output-schema /tmp/schema --output-last-message /tmp/final --color never 'review current changes'",
+        "codex-yuna exec --sandbox=read-only --json --output-schema /tmp/schema --output-last-message /tmp/final --color=never 'review current changes'",
+        "codex-yuna exec review --sandbox read-only --json --output-schema /tmp/schema --output-last-message /tmp/final 'review current changes'",
+    )
+
+    for command in commands:
+        assert terminal_tool._codex_unguarded_impl_launch_error(command) is None
+
+
+def test_codex_impl_guard_wrappers_are_not_blocked_as_unguarded_impl():
+    commands = (
+        "python scripts/runtime/codex_impl_guard.py --prompt 'implement one slice'",
+        "python scripts/runtime/codex_stage_runner.py --plan-file /tmp/stage-plan.json",
+        "python scripts/runtime/codex_review_guard.py --prompt 'review current changes'",
+        "codex-yuna exec --help",
+        "codex --version",
+    )
+
+    for command in commands:
+        assert terminal_tool._codex_unguarded_impl_launch_error(command) is None
+
+
+def test_terminal_tool_blocks_background_bare_codex_impl_before_execution():
+    result = json.loads(terminal_tool.terminal_tool(
+        command="codex-yuna exec --full-auto 'implement the change'",
+        background=True,
+        pty=True,
+        notify_on_complete=True,
+    ))
+
+    assert result["status"] == "blocked"
+    assert result["code"] == "codex_unguarded_impl_blocked"
+    assert result["recommended_action"] == "use_codex_staged_implement"
+    assert "已拦截裸 Codex 开发调用" in result["error"]
+    assert "codex_staged_implement" in result["error"]
+    assert "allowed_files" in result["error"]
+    assert "allowed_globs" in result["error"]
+    assert "codex_stage_runner.py" in result["error"]
+    assert "codex_impl_guard.py" in result["error"]
+    assert "codex_review_guard.py --prompt <TEXT>" in result["error"]
+    assert "新会话或 runtime 重载" in result["error"]
+    assert result["user_message_zh"] == result["error"]
+    assert "unguarded Codex implementation" in result["technical_detail"]
+    assert "codex_staged_implement" in result["technical_detail"]
+
+
+def test_bare_codex_after_controlled_wrapper_still_gets_guidance():
+    command = (
+        "python scripts/runtime/codex_impl_guard.py --prompt 'implement one slice'; "
+        "codex-yuna exec 'continue without guard'"
+    )
+
+    guidance = terminal_tool._foreground_background_guidance(command)
+
+    assert guidance is not None
+    assert "background=true" in guidance
+    assert "notify_on_complete=true" in guidance
+
+
+def test_codex_review_guard_rejects_missing_required_flags():
+    command = "codex-yuna exec review --uncommitted 'review current changes'"
+
+    error = terminal_tool._codex_review_launch_error(command)
+
+    assert error is not None
+    assert "--json" in error
+    assert "--output-schema" in error
+    assert "--output-last-message" in error
+    assert "Missing required flag(s): --json, --output-schema <FILE>, --output-last-message <FILE>." in error
+
+
+def test_codex_review_required_flags_must_be_in_same_command_segment():
+    commands = (
+        "codex-yuna exec review --uncommitted; echo --json --output-schema /tmp/schema --output-last-message /tmp/final",
+        "codex-yuna exec review --uncommitted && echo --json --output-schema /tmp/schema --output-last-message /tmp/final",
+        "codex-yuna exec review --uncommitted | echo --json --output-schema /tmp/schema --output-last-message /tmp/final",
+    )
 
 def test_terminal_blocks_foreground_codex_exec_before_launch(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_ALLOW_FOREGROUND_CODEX_EXEC", raising=False)
@@ -384,164 +513,3 @@ def test_terminal_allows_codex_help_foreground(monkeypatch, tmp_path):
 
     assert result["exit_code"] == 0
     assert executed["command"] == "codex exec --help"
-
-
-def test_background_codex_exec_without_notify_defaults_notify_on_complete(monkeypatch, tmp_path):
-    config = _base_terminal_config(tmp_path)
-    dummy_env = SimpleNamespace(env={})
-    spawned = {}
-
-    def fake_spawn_local(**_kwargs):
-        spawned.update(_kwargs)
-        return SimpleNamespace(
-            id="proc_codex",
-            pid=1234,
-            notify_on_complete=False,
-            watcher_platform="",
-        )
-
-    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *_args, **_kwargs: {"approved": True})
-    monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
-    monkeypatch.setitem(terminal_tool._active_environments, "default", dummy_env)
-    monkeypatch.setitem(terminal_tool._last_activity, "default", 0.0)
-
-    try:
-        result = json.loads(
-            terminal_tool.terminal_tool(
-                "codex exec implement the task",
-                background=True,
-                pty=True,
-                notify_on_complete=False,
-            )
-        )
-    finally:
-        terminal_tool._active_environments.pop("default", None)
-        terminal_tool._last_activity.pop("default", None)
-
-    assert spawned["use_pty"] is True
-    assert result["session_id"] == "proc_codex"
-    assert result["codex_exec_policy"] == "notify_on_complete_defaulted"
-    assert result["notify_on_complete_defaulted"] is True
-    assert result["notify_on_complete"] is True
-    assert "Hermes defaulted notify_on_complete=true" in result["hint"]
-
-
-def test_background_codex_exec_with_watch_patterns_prefers_completion(monkeypatch, tmp_path):
-    config = _base_terminal_config(tmp_path)
-    dummy_env = SimpleNamespace(env={})
-
-    def fake_spawn_local(**_kwargs):
-        return SimpleNamespace(
-            id="proc_codex_watch",
-            pid=1234,
-            notify_on_complete=False,
-            watcher_platform="",
-        )
-
-    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *_args, **_kwargs: {"approved": True})
-    monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
-    monkeypatch.setitem(terminal_tool._active_environments, "default", dummy_env)
-    monkeypatch.setitem(terminal_tool._last_activity, "default", 0.0)
-
-    try:
-        result = json.loads(
-            terminal_tool.terminal_tool(
-                "codex exec implement the task",
-                background=True,
-                pty=True,
-                notify_on_complete=False,
-                watch_patterns=["DONE"],
-            )
-        )
-    finally:
-        terminal_tool._active_environments.pop("default", None)
-        terminal_tool._last_activity.pop("default", None)
-
-    assert result["codex_exec_policy"] == "notify_on_complete_defaulted"
-    assert result["notify_on_complete"] is True
-    assert "watch_patterns ignored" in result["watch_patterns_ignored"]
-
-
-def test_background_codex_exec_default_notify_registers_gateway_watcher(monkeypatch, tmp_path):
-    config = _base_terminal_config(tmp_path)
-    dummy_env = SimpleNamespace(env={})
-    original_watchers = list(process_registry_module.process_registry.pending_watchers)
-
-    def fake_spawn_local(**_kwargs):
-        return SimpleNamespace(
-            id="proc_codex_gateway",
-            pid=1234,
-            notify_on_complete=False,
-            watcher_platform="",
-        )
-
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "qqbot")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-1")
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *_args, **_kwargs: {"approved": True})
-    monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
-    monkeypatch.setitem(terminal_tool._active_environments, "default", dummy_env)
-    monkeypatch.setitem(terminal_tool._last_activity, "default", 0.0)
-    process_registry_module.process_registry.pending_watchers.clear()
-
-    try:
-        result = json.loads(
-            terminal_tool.terminal_tool(
-                "codex exec implement the task",
-                background=True,
-                pty=True,
-                notify_on_complete=False,
-            )
-        )
-        watchers = list(process_registry_module.process_registry.pending_watchers)
-    finally:
-        process_registry_module.process_registry.pending_watchers[:] = original_watchers
-        terminal_tool._active_environments.pop("default", None)
-        terminal_tool._last_activity.pop("default", None)
-
-    assert result["notify_on_complete"] is True
-    assert watchers
-    assert watchers[-1]["session_id"] == "proc_codex_gateway"
-    assert watchers[-1]["platform"] == "qqbot"
-    assert watchers[-1]["notify_on_complete"] is True
-
-
-def test_foreground_codex_exec_escape_hatch_bypasses_only_foreground_guard(monkeypatch, tmp_path):
-    config = _base_terminal_config(tmp_path)
-    executed = {}
-
-    class DummyEnv:
-        def execute(self, command, **kwargs):
-            executed["command"] = command
-            executed["kwargs"] = kwargs
-            return {"output": "ok", "returncode": 0}
-
-    monkeypatch.setenv("HERMES_ALLOW_FOREGROUND_CODEX_EXEC", "1")
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
-    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
-    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *_args, **_kwargs: {"approved": True})
-    monkeypatch.setitem(terminal_tool._active_environments, "default", DummyEnv())
-    monkeypatch.setitem(terminal_tool._last_activity, "default", 0.0)
-
-    try:
-        result = json.loads(
-            terminal_tool.terminal_tool(
-                "codex exec implement the task",
-                background=False,
-                pty=True,
-            )
-        )
-    finally:
-        terminal_tool._active_environments.pop("default", None)
-        terminal_tool._last_activity.pop("default", None)
-
-    assert result["exit_code"] == 0
-    assert executed["command"] == "codex exec implement the task"

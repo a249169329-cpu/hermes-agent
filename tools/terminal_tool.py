@@ -843,6 +843,7 @@ Do NOT use ls to list directories — use search_files(target='files') instead.
 Do NOT use sed/awk to edit files — use patch instead.
 Do NOT use echo/cat heredoc to create files — use write_file instead.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
+For Codex implementation work, prefer the `codex_staged_implement` tool when available. Do NOT call raw `codex-yuna exec` / `codex exec` through terminal for implementation; terminal only runs the guarded fallback wrappers (`codex_stage_runner.py`, `codex_impl_guard.py`, `codex_review_guard.py`) or non-implementation checks such as version/auth probes.
 
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
 Background: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:
@@ -1936,6 +1937,265 @@ def _codex_exec_policy_error(command: str, *, background: bool, pty: bool) -> st
     return None
 
 
+def _shell_tokens(command: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(command or "", posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        return list(lexer)
+    except (TypeError, ValueError):
+        return []
+
+
+_TRANSPARENT_COMMAND_PREFIXES = {"sudo", "sudo.exe", "command", "builtin", "time", "nice", "timeout"}
+
+
+def _shell_command_basename(token: str) -> str:
+    stripped = token.strip("'\"")
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("$(", "(", "`"):
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):]
+                changed = True
+        for suffix in (")", "`"):
+            if stripped.endswith(suffix):
+                stripped = stripped[:-len(suffix)]
+                changed = True
+    return os.path.basename(stripped)
+
+
+def _codex_executable_indexes(tokens: list[str]) -> list[int]:
+    indexes: list[int] = []
+    for index, token in enumerate(tokens):
+        stripped = token.strip("'\"")
+        if stripped in {";", "&", "&&", "|", "||"}:
+            continue
+        exe = _shell_command_basename(stripped)
+        if exe in {"codex-yuna", "codex-yuna.exe", "codex", "codex.exe"}:
+            indexes.append(index)
+    return indexes
+
+
+def _codex_command_segment(tokens: list[str], exe_index: int) -> list[str]:
+    segment: list[str] = []
+    for token in tokens[exe_index:]:
+        stripped = token.strip("'\"")
+        if segment and stripped in {";", "&", "&&", "|", "||"}:
+            break
+        segment.append(stripped)
+    return segment
+
+
+def _codex_exec_index(segment: list[str]) -> int | None:
+    for index, token in enumerate(segment[1:], start=1):
+        if token == "exec":
+            return index
+    return None
+
+
+def _codex_segment_is_help_or_version(segment: list[str], exec_index: int) -> bool:
+    after_exec = segment[exec_index + 1:]
+    return bool(after_exec and all(token in {"--help", "-h", "--version", "-v"} for token in after_exec))
+
+
+def _flag_has_file_value(segment: list[str], flag: str) -> bool:
+    separators = {";", "&", "&&", "|", "||"}
+    prefix = flag + "="
+    for index, token in enumerate(segment):
+        if token.startswith(prefix):
+            value = token[len(prefix):]
+            return bool(value and not value.startswith("-") and value not in separators)
+        if token == flag:
+            if index + 1 >= len(segment):
+                return False
+            value = segment[index + 1]
+            return bool(value and not value.startswith("-") and value not in separators)
+    return False
+
+
+def _shell_wrapped_payloads(tokens: list[str]) -> list[str]:
+    payloads: list[str] = []
+    shell_names = {"bash", "bash.exe", "sh", "sh.exe", "zsh", "zsh.exe", "dash", "dash.exe"}
+    for index, token in enumerate(tokens):
+        stripped = token.strip("'\"")
+        if stripped in {";", "&", "&&", "|", "||"}:
+            continue
+        if os.path.basename(stripped) not in shell_names:
+            continue
+        for option_index in range(index + 1, len(tokens)):
+            option = tokens[option_index].strip("'\"")
+            if option in {";", "&", "&&", "|", "||"}:
+                break
+            if option == "-c" or (option.startswith("-") and "c" in option[1:]):
+                if option_index + 1 < len(tokens):
+                    payloads.append(tokens[option_index + 1])
+                break
+    return payloads
+
+
+def _codex_review_launch_error(command: str, _depth: int = 0) -> str | None:
+    """Return an error when a Codex review launch lacks hard output controls."""
+    tokens = _shell_tokens(command)
+    if not tokens:
+        return None
+
+    if _depth < 8:
+        for payload in _shell_wrapped_payloads(tokens):
+            nested_error = _codex_review_launch_error(payload, _depth=_depth + 1)
+            if nested_error is not None:
+                return nested_error
+
+    for exe_index in _codex_executable_indexes(tokens):
+        segment = _codex_command_segment(tokens, exe_index)
+        exec_index = _codex_exec_index(segment)
+        if exec_index is None:
+            continue
+        after_exec = segment[exec_index + 1:]
+        is_review = False
+        uses_review_subcommand = bool(after_exec and after_exec[0] == "review")
+        if uses_review_subcommand or re.search(r"\breview\b", " ".join(after_exec), re.IGNORECASE):
+            is_review = True
+        else:
+            if "--sandbox" in after_exec:
+                try:
+                    sandbox_index = after_exec.index("--sandbox")
+                    read_only = (
+                        sandbox_index + 1 < len(after_exec)
+                        and after_exec[sandbox_index + 1] == "read-only"
+                    )
+                except ValueError:
+                    read_only = False
+            else:
+                read_only = "--sandbox=read-only" in after_exec
+            if read_only and re.search(r"\breview\b", " ".join(segment), re.IGNORECASE):
+                is_review = True
+        if not is_review:
+            continue
+
+        missing: list[str] = []
+        if "--json" not in segment:
+            missing.append("--json")
+        if not _flag_has_file_value(segment, "--output-schema"):
+            missing.append("--output-schema <FILE>")
+        if not _flag_has_file_value(segment, "--output-last-message"):
+            missing.append("--output-last-message <FILE>")
+        has_color_never = True if uses_review_subcommand else any(t == "--color=never" for t in segment)
+        if not uses_review_subcommand:
+            for index, token in enumerate(segment[:-1]):
+                if token == "--color" and segment[index + 1] == "never":
+                    has_color_never = True
+                    break
+        if not has_color_never:
+            missing.append("--color never")
+
+        if missing:
+            return (
+                "Codex review launches must use guarded structured output controls. "
+                "Missing required flag(s): " + ", ".join(missing) + ". "
+                "Use `python scripts/runtime/codex_review_guard.py --prompt <TEXT>` as the "
+                "preferred guarded wrapper. For `codex-yuna exec review`, include "
+                "`--json --output-schema <FILE> --output-last-message <FILE>`; for generic "
+                "read-only `codex-yuna exec --sandbox read-only` review prompts, also include "
+                "`--color never`."
+            )
+    return None
+
+
+def _codex_segment_has_review_output_controls(segment: list[str], *, uses_review_subcommand: bool) -> bool:
+    if "--json" not in segment:
+        return False
+    if not _flag_has_file_value(segment, "--output-schema"):
+        return False
+    if not _flag_has_file_value(segment, "--output-last-message"):
+        return False
+    if uses_review_subcommand:
+        return True
+    if "--color=never" in segment:
+        return True
+    return any(token == "--color" and index + 1 < len(segment) and segment[index + 1] == "never" for index, token in enumerate(segment))
+
+
+def _codex_segment_has_write_intent(tokens: list[str]) -> bool:
+    text = " ".join(tokens)
+    return bool(re.search(
+        r"\b(implement|fix|modify|edit|write|apply|patch|create|delete|remove|update|commit|push|deploy|restart)\b",
+        text,
+        re.IGNORECASE,
+    ))
+
+
+def _codex_segment_is_read_only_review(segment: list[str], after_exec: list[str]) -> bool:
+    uses_review_subcommand = bool(after_exec and after_exec[0] == "review")
+    if "--sandbox" in after_exec:
+        try:
+            sandbox_index = after_exec.index("--sandbox")
+            read_only = sandbox_index + 1 < len(after_exec) and after_exec[sandbox_index + 1] == "read-only"
+        except ValueError:
+            read_only = False
+    else:
+        read_only = "--sandbox=read-only" in after_exec
+    review_intent = uses_review_subcommand or bool(re.search(r"\breview\b", " ".join(segment), re.IGNORECASE))
+    if not review_intent:
+        return False
+    intent_tokens = after_exec[1:] if uses_review_subcommand else after_exec
+    if _codex_segment_has_write_intent(intent_tokens):
+        return False
+    return bool(read_only and _codex_segment_has_review_output_controls(segment, uses_review_subcommand=uses_review_subcommand))
+
+
+def _codex_unguarded_impl_launch_error(command: str, _depth: int = 0) -> str | None:
+    """Block write-capable bare Codex implementation launches."""
+    tokens = _shell_tokens(command)
+    if not tokens:
+        return None
+
+    if _depth < 8:
+        for payload in _shell_wrapped_payloads(tokens):
+            nested_error = _codex_unguarded_impl_launch_error(payload, _depth=_depth + 1)
+            if nested_error is not None:
+                return nested_error
+
+    for exe_index in _codex_executable_indexes(tokens):
+        segment = _codex_command_segment(tokens, exe_index)
+        exec_index = _codex_exec_index(segment)
+        if exec_index is None:
+            continue
+        if _codex_segment_is_help_or_version(segment, exec_index):
+            continue
+        after_exec = segment[exec_index + 1:]
+        if _codex_segment_is_read_only_review(segment, after_exec):
+            continue
+        return (
+            "Blocked unguarded Codex implementation launch. Raw `codex-yuna exec` / "
+            "`codex exec` prompts do not include the stage allowlist, dirty-baseline "
+            "policy, or review stop contract needed to prevent diff flood. If the "
+            "`codex_staged_implement` tool is available, use it with explicit "
+            "`allowed_files` / `allowed_globs`. Otherwise use "
+            "`python scripts/runtime/codex_stage_runner.py --plan-file <JSON>` for staged "
+            "work, or `python scripts/runtime/codex_impl_guard.py ...` for one bounded "
+            "implementation slice. For read-only review, use "
+            "`python scripts/runtime/codex_review_guard.py --prompt <TEXT>`."
+        )
+    return None
+
+
+def _codex_unguarded_impl_user_message_zh() -> str:
+    return (
+        "已拦截裸 Codex 开发调用。\n\n"
+        "原因：裸 `codex-yuna exec` / `codex exec` 没有文件范围、dirty baseline、"
+        "review 停止边界，容易造成 diff flood。\n\n"
+        "请改用：\n"
+        "- 如果当前会话有 `codex_staged_implement` tool：用它，并显式传入 "
+        "`allowed_files` / `allowed_globs`\n"
+        "- 如果当前会话还看不到该 tool：用 "
+        "`python scripts/runtime/codex_stage_runner.py --plan-file <JSON>`\n"
+        "- 单个有界实现切片：用 `python scripts/runtime/codex_impl_guard.py ...`\n\n"
+        "如果只是只读 review，请用 `python scripts/runtime/codex_review_guard.py --prompt <TEXT>`。\n"
+        "注意：新 tool 需要新会话或 runtime 重载后才会出现在 tool schema 里。"
+    )
+
+
 def _looks_like_help_or_version_command(command: str) -> bool:
     """Return True for informational invocations that should never be blocked."""
     normalized = " ".join(command.lower().split())
@@ -1979,6 +2239,38 @@ def _foreground_background_guidance(command: str) -> str | None:
                 "This foreground command appears to start a long-lived server/watch process. "
                 "Run it with background=true, verify readiness (health endpoint/log signal), "
                 "then execute tests in a separate command."
+            )
+
+    tokens = _shell_tokens(command)
+    seen_codex_exec = False
+    for exe_index in _codex_executable_indexes(tokens):
+        segment = _codex_command_segment(tokens, exe_index)
+        exec_index = _codex_exec_index(segment)
+        if exec_index is None:
+            continue
+        seen_codex_exec = True
+        if _codex_segment_is_help_or_version(segment, exec_index):
+            continue
+        return (
+            "This foreground command starts Codex CLI, which can keep writing files or "
+            "summarizing after long output and may not exit before the foreground timeout. "
+            "Run Codex with background=true and notify_on_complete=true, then inspect "
+            "git status/diff and logs after it exits or times out. Ask Codex to avoid "
+            "large recursive grep output, avoid full diffs in stdout, and run only "
+            "focused tests; Hermes should run final verification separately."
+        )
+    if seen_codex_exec:
+        return None
+
+    for pattern in _LONG_RUNNING_CODING_AGENT_PATTERNS:
+        if pattern.search(unquoted):
+            return (
+                "This foreground command starts Codex CLI, which can keep writing files or "
+                "summarizing after long output and may not exit before the foreground timeout. "
+                "Run Codex with background=true and notify_on_complete=true, then inspect "
+                "git status/diff and logs after it exits or times out. Ask Codex to avoid "
+                "large recursive grep output, avoid full diffs in stdout, and run only "
+                "focused tests; Hermes should run final verification separately."
             )
 
     return None
@@ -2151,6 +2443,23 @@ def terminal_tool(
                 "error": codex_policy_error,
                 "status": "error",
                 "codex_exec_policy": "blocked",
+            }, ensure_ascii=False)
+
+        # Guardrail: write-capable Codex implementation must use the staged
+        # runner or single-slice implementation guard. Background mode should
+        # not bypass the allowlist/dirty-baseline contract.
+        codex_impl_error = _codex_unguarded_impl_launch_error(command)
+        if codex_impl_error:
+            user_message_zh = _codex_unguarded_impl_user_message_zh()
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": user_message_zh,
+                "code": "codex_unguarded_impl_blocked",
+                "user_message_zh": user_message_zh,
+                "technical_detail": codex_impl_error,
+                "recommended_action": "use_codex_staged_implement",
+                "status": "blocked",
             }, ensure_ascii=False)
 
         # Guardrail: long-lived server/watch commands should run as managed
