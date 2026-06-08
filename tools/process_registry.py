@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import signal
 import subprocess
@@ -113,6 +114,10 @@ class ProcessSession:
     diff_flood_detected: bool = False           # Sticky once high-volume diff-like output is detected
     diff_flood_score: float = 0.0
     diff_flood_first_seen_at: float = 0.0
+    source_flood_detected: bool = False         # Sticky once high-volume source-like output is detected
+    source_flood_score: float = 0.0
+    source_flood_first_seen_at: float = 0.0
+    review_unusable: bool = False               # Codex review flooded before a trusted structured verdict
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     kill_attempted: bool = False                # A kill request was attempted for this session
@@ -361,6 +366,33 @@ class ProcessRegistry:
             "process(action='log') full scan unless debugging agent output itself."
         )
 
+    @staticmethod
+    def _is_source_like_line(line: str) -> bool:
+        stripped = strip_ansi(line).strip()
+        if not stripped:
+            return False
+        if re.match(r"^(from\s+\S+\s+import\s+|import\s+\S+|class\s+\w+|def\s+\w+|async\s+def\s+\w+)", stripped):
+            return True
+        if re.match(r"^(export\s+)?(async\s+)?function\s+\w+", stripped):
+            return True
+        if re.match(r"^(const|let|var)\s+\w+\s*=", stripped):
+            return True
+        if stripped.startswith(("return ", "if ", "elif ", "else:", "for ", "while ", "try:", "except ")):
+            return True
+        if stripped.startswith(("<div", "<span", "<template", "<script", "</", "function(", "public ", "private ")):
+            return True
+        if stripped in {"{", "}", "};"}:
+            return True
+        return False
+
+    @staticmethod
+    def _source_flood_recommendation() -> str:
+        return (
+            "Source-like output flood detected. Treat Codex review output as unusable "
+            "unless a schema-valid final review file exists; inspect source files directly "
+            "instead of tailing raw Codex logs."
+        )
+
     def _append_output(self, session: ProcessSession, text: str) -> None:
         """Append process output and update rolling-output metadata.
 
@@ -427,6 +459,25 @@ class ProcessRegistry:
                         session.diff_flood_detected = True
                         session.diff_flood_first_seen_at = time.time()
 
+                if total >= 80:
+                    source_like = sum(1 for line in recent if self._is_source_like_line(line))
+                    source_score = source_like / total if total else 0.0
+                    session.source_flood_score = max(session.source_flood_score, round(source_score, 3))
+                    if (
+                        not session.source_flood_detected
+                        and source_like >= 60
+                        and source_score >= 0.35
+                    ):
+                        session.source_flood_detected = True
+                        session.source_flood_first_seen_at = time.time()
+
+                if (
+                    session.source_flood_detected
+                    and self._is_codex_review_command(session.command)
+                    and (session.output_total_chars >= 50_000 or session.output_total_lines >= 500)
+                ):
+                    session.review_unusable = True
+
     @staticmethod
     def _output_metadata(session: ProcessSession, returned_text: Optional[str] = None) -> dict:
         buffer_chars = session.output_buffer_chars or len(session.output_buffer)
@@ -443,11 +494,17 @@ class ProcessRegistry:
             "diff_flood_detected": session.diff_flood_detected,
             "diff_flood_score": session.diff_flood_score,
             "diff_flood_first_seen_at": session.diff_flood_first_seen_at or None,
+            "source_flood_detected": session.source_flood_detected,
+            "source_flood_score": session.source_flood_score,
+            "source_flood_first_seen_at": session.source_flood_first_seen_at or None,
+            "review_unusable": session.review_unusable,
         }
         if returned_text is not None:
             data["returned_chars"] = len(returned_text)
         if session.diff_flood_first_seen_at:
             data["diff_flood_recommended_next_action"] = ProcessRegistry._diff_flood_recommendation()
+        if session.source_flood_first_seen_at:
+            data["source_flood_recommended_next_action"] = ProcessRegistry._source_flood_recommendation()
         return data
 
     @staticmethod
@@ -472,6 +529,8 @@ class ProcessRegistry:
         stdout_lines = evt.get("stdout_lines", evt.get("output_total_lines", "?"))
         buffer_truncated = bool(evt.get("buffer_truncated", False))
         diff_flood = bool(evt.get("diff_flood_detected", False))
+        source_flood = bool(evt.get("source_flood_detected", False))
+        review_unusable = bool(evt.get("review_unusable", False))
         trusted = evt.get("trusted_completion")
         parts = [
             "Codex output suppressed for context safety.",
@@ -482,6 +541,8 @@ class ProcessRegistry:
             f"stdout_lines={stdout_lines}",
             f"buffer_truncated={buffer_truncated}",
             f"diff_flood_detected={diff_flood}",
+            f"source_flood_detected={source_flood}",
+            f"review_unusable={review_unusable}",
         ]
         if trusted is not None:
             parts.append(f"trusted_completion={bool(trusted)}")
@@ -491,6 +552,8 @@ class ProcessRegistry:
             parts.append("raw_log_available_via_process_log=True")
         if diff_flood:
             parts.append(ProcessRegistry._diff_flood_recommendation())
+        if source_flood:
+            parts.append(ProcessRegistry._source_flood_recommendation())
         return "\n".join(parts)
 
     @staticmethod
@@ -651,6 +714,50 @@ class ProcessRegistry:
                 ):
                     return True
 
+            command_position = False
+        return False
+
+    @staticmethod
+    def _is_codex_review_command(command: str) -> bool:
+        try:
+            lexer = shlex.shlex(command or "", posix=True, punctuation_chars=";&|")
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+        except (TypeError, ValueError):
+            return False
+
+        command_position = True
+        for index, token in enumerate(tokens):
+            stripped = token.strip("'\"")
+            if stripped in {";", "&", "&&", "|", "||"}:
+                command_position = True
+                continue
+            if command_position and (
+                stripped == "env"
+                or "=" in stripped and not stripped.startswith(("/", "./", "../"))
+            ):
+                continue
+            if command_position:
+                exe = os.path.basename(stripped)
+                if exe in {"codex-yuna", "codex-yuna.exe", "codex", "codex.exe"}:
+                    following = [t.strip("'\"") for t in tokens[index + 1:]]
+                    if following and following[0] == "exec":
+                        after_exec = following[1:]
+                        if "review" in after_exec[:6]:
+                            return True
+                        if "--sandbox" in after_exec:
+                            try:
+                                sandbox_index = after_exec.index("--sandbox")
+                                read_only = (
+                                    sandbox_index + 1 < len(after_exec)
+                                    and after_exec[sandbox_index + 1] == "read-only"
+                                )
+                            except ValueError:
+                                read_only = False
+                        else:
+                            read_only = "--sandbox=read-only" in after_exec
+                        if read_only and re.search(r"\breview\b", command, re.IGNORECASE):
+                            return True
             command_position = False
         return False
 
