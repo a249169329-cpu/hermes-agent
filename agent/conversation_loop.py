@@ -71,6 +71,191 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+_COMPRESSION_CIRCUIT_BREAKER_MESSAGE = (
+    "🛑 context 刚压缩恢复，本轮自动停止。\n\n"
+    "为避免继续启动 Codex、全量验证、build 或其它重任务压垮服务器，"
+    "请新开会话或回复“继续下一阶段”后再继续。"
+)
+
+_PROVIDER_ERROR_COMPRESSION_INCLUDE_STRINGS = (
+    "an error occurred while processing your request",
+    "you can retry your request",
+    "please include the request id",
+    "ttfb cutoff",
+    "codex stream produced no bytes",
+    "connection error",
+    "eof",
+    "broken pipe",
+    "http 520",
+    "http 524",
+    "internal server error",
+    "stream produced no bytes",
+)
+
+_PROVIDER_ERROR_COMPRESSION_EXCLUDE_STRINGS = (
+    "auth_unavailable",
+    "incorrect api key",
+    "unauthorized",
+    "not authorized",
+    "permission denied",
+    "not permitted",
+    "quota",
+    "usage limit",
+    "rate limit",
+    "cooling down",
+    "model not found",
+    "soft stable limit",
+)
+
+_PROVIDER_ERROR_COMPRESSION_EXCLUDED_REASONS = {
+    FailoverReason.auth,
+    FailoverReason.auth_permanent,
+    FailoverReason.billing,
+    FailoverReason.rate_limit,
+    FailoverReason.model_not_found,
+}
+
+
+def _provider_error_text_for_compression(error: Exception) -> str:
+    """Best-effort text surface for conservative provider-error matching."""
+    parts: list[str] = []
+    for value in (
+        error,
+        getattr(error, "message", None),
+        getattr(error, "body", None),
+        getattr(error, "response", None),
+    ):
+        if value is None:
+            continue
+        try:
+            if hasattr(value, "text"):
+                parts.append(str(value.text))
+            else:
+                parts.append(str(value))
+        except Exception:
+            pass
+    status_code = getattr(error, "status_code", None)
+    if status_code is not None:
+        parts.append(f"http {status_code}")
+    return " ".join(parts).lower()
+
+
+def _looks_like_provider_error_for_compression(
+    error: Exception,
+    classified: Any,
+) -> bool:
+    """Return True for generic provider/gateway transient failures only."""
+    if getattr(classified, "reason", None) in _PROVIDER_ERROR_COMPRESSION_EXCLUDED_REASONS:
+        return False
+
+    status_code = getattr(classified, "status_code", None)
+    if status_code is None:
+        status_code = getattr(error, "status_code", None)
+    try:
+        status_int = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_int = None
+    if status_int in {401, 402, 403, 404, 429}:
+        return False
+
+    text = _provider_error_text_for_compression(error)
+    if any(p in text for p in _PROVIDER_ERROR_COMPRESSION_EXCLUDE_STRINGS):
+        return False
+    if any(p in text for p in _PROVIDER_ERROR_COMPRESSION_INCLUDE_STRINGS):
+        return True
+
+    return bool(
+        status_int in {500, 502, 503, 520, 524}
+        and getattr(classified, "reason", None)
+        in {FailoverReason.server_error, FailoverReason.overloaded, FailoverReason.timeout, FailoverReason.unknown}
+    )
+
+
+def _compression_circuit_breaker_enabled(agent: Any) -> bool:
+    """Return True when automatic compression should halt gateway turns.
+
+    CLI users historically expect compression to be transparent and continue
+    the current turn.  Messaging gateway sessions are different: a long QQ turn
+    can immediately continue into Codex / pytest / build work after recovering
+    from a huge context window, which can saturate small servers.  Default the
+    breaker to non-CLI platforms while leaving CLI/WebUI direct workflows alone.
+    """
+    if os.getenv("HERMES_DISABLE_COMPRESSION_CIRCUIT_BREAKER", "").lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return False
+    try:
+        from gateway.session_context import get_session_env
+
+        session_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:
+        session_platform = ""
+    platform = str(
+        getattr(agent, "platform", None)
+        or os.environ.get("HERMES_PLATFORM", "")
+        or session_platform
+        or os.environ.get("HERMES_SESSION_SOURCE", "")
+        or ""
+    ).strip().lower()
+    if not platform or platform in {"cli", "webui", "local"}:
+        return False
+    return True
+
+
+def _should_halt_after_auto_compression(
+    agent: Any,
+    *,
+    original_len: int,
+    context_reduced: bool = False,
+) -> bool:
+    """Decide whether an automatic compression event should stop the turn."""
+    if not _compression_circuit_breaker_enabled(agent):
+        return False
+    recovery_stage = getattr(agent.context_compressor, "_last_summary_recovery_stage", None)
+    summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
+    compressed_len = len(getattr(agent, "_session_messages", []) or [])
+    # Most call sites update ``messages`` before assigning _session_messages;
+    # callers therefore pass ``original_len`` and we check the current local
+    # length separately at the call site.  ``compressed_len`` is only a fallback
+    # for tests/alternate callers that already assigned the session messages.
+    return bool(
+        context_reduced
+        or recovery_stage in {"safe_retry", "chunked", "extractive_fallback"}
+        or summary_error
+        or (compressed_len and compressed_len < original_len)
+    )
+
+
+def _halt_after_compression_circuit_breaker(
+    agent: Any,
+    messages: list,
+    conversation_history: Optional[list],
+    api_call_count: int,
+    effective_task_id: str,
+) -> Dict[str, Any]:
+    """Persist a controlled stop after compression recovery and return."""
+    final_response = _COMPRESSION_CIRCUIT_BREAKER_MESSAGE
+    messages.append({"role": "assistant", "content": final_response})
+    agent._cleanup_task_resources(effective_task_id)
+    agent._persist_session(messages, conversation_history)
+    logger.warning(
+        "Compression circuit breaker halted turn: platform=%s session=%s messages=%d",
+        getattr(agent, "platform", None),
+        getattr(agent, "session_id", None) or "none",
+        len(messages),
+    )
+    return {
+        "final_response": final_response,
+        "messages": messages,
+        "api_calls": api_call_count,
+        "completed": False,
+        "partial": True,
+        "failed": False,
+        "compression_circuit_breaker": True,
+        "turn_exit_reason": "compression_circuit_breaker",
+    }
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -431,6 +616,22 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    _preflight_halt_original_len = getattr(agent, "_preflight_compression_halt_original_len", None)
+    if _preflight_halt_original_len is not None:
+        agent._preflight_compression_halt_original_len = None
+        if _should_halt_after_auto_compression(
+            agent,
+            original_len=_preflight_halt_original_len,
+            context_reduced=True,
+        ):
+            return _halt_after_compression_circuit_breaker(
+                agent,
+                messages,
+                conversation_history,
+                api_call_count=0,
+                effective_task_id=effective_task_id,
+            )
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -2537,6 +2738,18 @@ def run_conversation(
                         # so _flush_messages_to_session_db writes compressed
                         # messages to the new session, not skipping them.
                         conversation_history = None
+                        if _should_halt_after_auto_compression(
+                            agent,
+                            original_len=original_len,
+                            context_reduced=(len(messages) < original_len or old_ctx > _reduced_ctx),
+                        ):
+                            return _halt_after_compression_circuit_breaker(
+                                agent,
+                                messages,
+                                conversation_history,
+                                api_call_count,
+                                effective_task_id,
+                            )
                         if len(messages) < original_len or old_ctx > _reduced_ctx:
                             agent._buffer_status(
                                 f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
@@ -2715,6 +2928,18 @@ def run_conversation(
                     conversation_history = None
 
                     if len(messages) < original_len:
+                        if _should_halt_after_auto_compression(
+                            agent,
+                            original_len=original_len,
+                            context_reduced=True,
+                        ):
+                            return _halt_after_compression_circuit_breaker(
+                                agent,
+                                messages,
+                                conversation_history,
+                                api_call_count,
+                                effective_task_id,
+                            )
                         agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
@@ -2871,6 +3096,18 @@ def run_conversation(
                     conversation_history = None
 
                     if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
+                        if _should_halt_after_auto_compression(
+                            agent,
+                            original_len=original_len,
+                            context_reduced=(len(messages) < original_len or bool(new_ctx and new_ctx < old_ctx)),
+                        ):
+                            return _halt_after_compression_circuit_breaker(
+                                agent,
+                                messages,
+                                conversation_history,
+                                api_call_count,
+                                effective_task_id,
+                            )
                         if len(messages) < original_len:
                             agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
                         time.sleep(2)  # Brief pause between compression retries
@@ -2892,6 +3129,62 @@ def run_conversation(
                             "failed": True,
                             "compression_exhausted": True,
                         }
+
+                soft_request_limit = getattr(agent, "compression_soft_request_limit", 0) or 0
+                try:
+                    soft_request_limit = int(soft_request_limit)
+                except (TypeError, ValueError):
+                    soft_request_limit = 0
+
+                if (
+                    getattr(agent, "compression_enabled", False)
+                    and getattr(agent, "retry_compress_on_provider_error", False)
+                    and soft_request_limit > 0
+                    and approx_request_tokens >= soft_request_limit
+                    and not _retry.provider_error_compression_attempted
+                    and _looks_like_provider_error_for_compression(api_error, classified)
+                ):
+                    _retry.provider_error_compression_attempted = True
+                    original_len = len(messages)
+                    agent._emit_status(
+                        f"🗜️ Provider error on large request (~{approx_request_tokens:,} tokens) — "
+                        "compressing once before retry..."
+                    )
+                    messages, active_system_prompt = agent._compress_context(
+                        messages,
+                        system_message,
+                        approx_tokens=approx_request_tokens,
+                        task_id=effective_task_id,
+                    )
+                    # Compression creates a new session; clear the old
+                    # history reference so persistence writes the compressed
+                    # transcript instead of skipping it by length.
+                    conversation_history = None
+                    if len(messages) < original_len:
+                        if _should_halt_after_auto_compression(
+                            agent,
+                            original_len=original_len,
+                            context_reduced=True,
+                        ):
+                            return _halt_after_compression_circuit_breaker(
+                                agent,
+                                messages,
+                                conversation_history,
+                                api_call_count,
+                                effective_task_id,
+                            )
+                        agent._emit_status(
+                            f"🗜️ Compressed {original_len} → {len(messages)} messages after provider error, retrying..."
+                        )
+                        _retry.restart_with_compressed_messages = True
+                        break
+                    logger.info(
+                        "Provider-error compression did not reduce messages; falling through to normal retry. "
+                        "session=%s tokens=~%s limit=%s",
+                        getattr(agent, "session_id", None) or "none",
+                        f"{approx_request_tokens:,}",
+                        soft_request_limit,
+                    )
 
                 # Check for non-retryable client errors.  The classifier
                 # already accounts for 413, 429, 529 (transient), context
@@ -3818,6 +4111,7 @@ def run_conversation(
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
+                    _orig_len = len(messages)
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
@@ -3827,6 +4121,18 @@ def run_conversation(
                     # _flush_messages_to_session_db writes compressed messages
                     # to the new session (see preflight compression comment).
                     conversation_history = None
+                    if _should_halt_after_auto_compression(
+                        agent,
+                        original_len=_orig_len,
+                        context_reduced=len(messages) < _orig_len,
+                    ):
+                        return _halt_after_compression_circuit_breaker(
+                            agent,
+                            messages,
+                            conversation_history,
+                            api_call_count,
+                            effective_task_id,
+                        )
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
