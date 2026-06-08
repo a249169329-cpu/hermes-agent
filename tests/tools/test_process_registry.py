@@ -200,6 +200,37 @@ class TestOutputHardening:
         assert s.diff_flood_detected is False
         assert s.diff_flood_score > 0
 
+    def test_source_flood_detection_marks_codex_review_unusable(self, registry):
+        s = _make_session(
+            command=(
+                "codex-yuna exec review --uncommitted --json "
+                "--output-schema /tmp/schema.json "
+                "--output-last-message /tmp/final.json --color never"
+            )
+        )
+        source_lines = []
+        for i in range(700):
+            source_lines.extend([
+                "import os\n",
+                "from pathlib import Path\n",
+                f"class Flood{i}:\n",
+                "    def method(self):\n",
+                "        return Path.cwd()\n",
+            ])
+
+        registry._append_output(s, "".join(source_lines))
+        registry._running[s.id] = s
+
+        assert s.source_flood_detected is True
+        assert s.source_flood_score > 0
+        assert s.source_flood_first_seen_at > 0
+        assert s.review_unusable is True
+
+        poll = registry.poll(s.id)
+        assert poll["source_flood_detected"] is True
+        assert poll["review_unusable"] is True
+        assert "source_flood_detected=True" in poll["output"]
+
     def test_poll_wait_read_log_and_list_include_output_metadata(self, registry, monkeypatch):
         s = _make_session(exited=True, exit_code=0)
         registry._append_output(s, "line 1\nline 2\n")
