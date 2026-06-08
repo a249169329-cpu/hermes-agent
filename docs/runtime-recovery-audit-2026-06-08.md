@@ -250,11 +250,59 @@
 1. 用户确认后，可 commit 第 1 批 live diff，或继续第 2 批。
 2. 当前未重启 gateway/WebUI；如果需要让运行态立刻加载第 1 批代码，必须另行确认重启/热加载策略。
 
+## 第 2 批执行记录：compression / gateway recovery 2A
+
+状态：**2A 已落到 live 工作区并完成 focused 验证，未 commit，未 push，未重启**。
+
+范围：2A 只恢复 `provider-error compression retry + recovery halt`；2B（wall-clock cap + session split persistence）未做。
+
+- 隔离 worktree：`/workspace/.hermes-worktrees/hermes-agent-runtime-codex-compression-2a-20260608101914`
+- 隔离分支：`recover/compression-2a-20260608101914`
+- 基线 HEAD：`a015b1ca8 fix(session-search): restore scoped handoff recall`
+- 候选来源：
+  - `09c894891 fix(gateway): halt after compression recovery`
+  - `9325d7e62 fix(compression): compress large provider errors before retry`
+  - 注：文档原候选 `430944988` 与 `9325d7e62` tree-level diff 等价；本批采用 provider-error side worktree HEAD `9325d7e62` 以减少无关旧链路干扰。
+- 冲突处理：
+  - `agent/conversation_loop.py`：保留当前 live 的 `build_turn_context` / `TurnRetryState` 重构，不回退旧内联 prologue；加入 compression circuit breaker、provider-error large-request compression retry、gateway halt 返回。
+  - `agent/turn_context.py`：用轻量 marker 记录 preflight compression 已降低上下文，由 `conversation_loop.py` 返回后决定是否 halt，避免 `turn_context.py` 反向 import `conversation_loop.py`。
+  - `agent/turn_retry_state.py`：把旧 commit 的 `provider_error_compression_attempted` 裸局部变量迁移为 `TurnRetryState.provider_error_compression_attempted`。
+  - `tests/run_agent/test_413_compression.py`：保留当前 live multi-pass preflight 语义；gateway 路径验证首次压缩后 halt，`cli/webui/local` 与 env-disabled breaker 允许继续。
+- 隔离 worktree touched files：
+  - `agent/agent_init.py`
+  - `agent/conversation_loop.py`
+  - `agent/turn_context.py`
+  - `agent/turn_retry_state.py`
+  - `hermes_cli/config.py`
+  - `tests/run_agent/test_413_compression.py`
+- 隔离验证命令与结果：
+  - `python -m py_compile agent/context_compressor.py agent/conversation_compression.py agent/conversation_loop.py agent/turn_context.py agent/turn_retry_state.py run_agent.py agent/agent_init.py hermes_cli/config.py` ✅
+  - `python -m pytest tests/run_agent/test_413_compression.py -q -o addopts=''` ✅ `47 passed, 1 warning in 27.14s`
+  - `python -m pytest tests/agent/test_context_compressor.py -q -o addopts=''` ✅ `94 passed, 1 warning in 5.95s`
+  - `python -m pytest tests/run_agent/test_compression_persistence.py tests/run_agent/test_compression_feasibility.py -q -o addopts=''` ✅ `22 passed, 1 warning in 23.82s`
+  - `git diff --check HEAD` ✅
+  - `*.pyc` 缓存清理与复查 ✅ `deleted_pyc=8`，最终 `0`
+- live 应用方式：从隔离 worktree 生成 staged binary patch `/tmp/hermes-b2a-compression-recovery.patch`，`git apply --check` 通过后应用到 live。
+- live 验证命令与结果：
+  - `python -m py_compile agent/context_compressor.py agent/conversation_compression.py agent/conversation_loop.py agent/turn_context.py agent/turn_retry_state.py run_agent.py agent/agent_init.py hermes_cli/config.py` ✅
+  - `python -m pytest tests/run_agent/test_413_compression.py -q -o addopts=''` ✅ `47 passed, 1 warning in 29.16s`
+  - `python -m pytest tests/agent/test_context_compressor.py -q -o addopts=''` ✅ `94 passed, 1 warning in 6.41s`
+  - `python -m pytest tests/run_agent/test_compression_persistence.py tests/run_agent/test_compression_feasibility.py -q -o addopts=''` ✅ `22 passed, 1 warning in 28.53s`
+  - `git diff --check HEAD` ✅
+  - `*.pyc` 缓存清理与复查 ✅ `deleted_pyc=8`，最终 `0`
+- 当前隔离 worktree 状态：保留 staged candidate diff，未 commit。
+- live 状态：2A 代码已应用到 live 工作区；未 commit，未 push，未重启。另发现一个非本轮未跟踪文档 `docs/codex-workflow-local-capability-and-external-recommendations-2026-06-08.md`，本批未触碰。
+
+下一步选择：
+
+1. 建议先为第 2 批 2A live diff 做本地 commit 稳定点，再继续 2B。
+2. 当前未重启 gateway/WebUI；如果需要运行态加载 2A，必须另行确认 restart/reload。
+
 ## 当前待办
 
 - [x] 第 0 批：初版恢复清单。
-- [x] 第 1 批：session_search scope handoff（已落 live 工作区，focused 验证通过，未 commit/未重启）。
-- [ ] 第 2 批：compression / gateway recovery。
+- [x] 第 1 批：session_search scope handoff（已落 live 并本地 commit，未 push/未重启）。
+- [>] 第 2 批：compression / gateway recovery（2A 已落 live 工作区并通过 focused 验证，未 commit/未重启；2B 未做）。
 - [ ] 第 3 批：process / Codex output governance。
 - [ ] 第 4 批：terminal raw Codex policy。
 - [ ] 第 5 批：guarded Codex workflow tools。

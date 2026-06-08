@@ -23,6 +23,7 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -32,6 +33,30 @@ from agent.iteration_budget import IterationBudget
 from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
+
+
+def _preflight_compression_circuit_breaker_enabled(agent: Any) -> bool:
+    """Mirror the turn-loop breaker gate without importing conversation_loop."""
+    if os.getenv("HERMES_DISABLE_COMPRESSION_CIRCUIT_BREAKER", "").lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return False
+    try:
+        from gateway.session_context import get_session_env
+
+        session_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:
+        session_platform = ""
+    platform = str(
+        getattr(agent, "platform", None)
+        or os.environ.get("HERMES_PLATFORM", "")
+        or session_platform
+        or os.environ.get("HERMES_SESSION_SOURCE", "")
+        or ""
+    ).strip().lower()
+    if not platform or platform in {"cli", "webui", "local"}:
+        return False
+    return True
 
 
 @dataclass
@@ -129,6 +154,7 @@ def build_turn_context(
     agent._current_api_request_id = ""
 
     # Reset retry counters and iteration budget at the start of each turn.
+    agent._preflight_compression_halt_original_len = None
     agent._invalid_tool_retries = 0
     agent._invalid_json_retries = 0
     agent._empty_content_retries = 0
@@ -305,6 +331,9 @@ def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
+                agent._preflight_compression_halt_original_len = _orig_len
+                if _preflight_compression_circuit_breaker_enabled(agent):
+                    break
                 _preflight_tokens = estimate_request_tokens_rough(
                     messages,
                     system_prompt=active_system_prompt or "",
