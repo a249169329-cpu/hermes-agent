@@ -1973,7 +1973,7 @@ def _messages_to_persist_after_agent_run(
         entry = {"role": "user", "content": message_text, "timestamp": timestamp}
         if platform_message_id:
             entry["message_id"] = str(platform_message_id)
-        return [entry], False
+        return [entry], bool(session_db_available)
 
     history_len = agent_result.get("history_offset", 0)
     if not isinstance(history_len, int) or history_len < 0:
@@ -1983,7 +1983,7 @@ def _messages_to_persist_after_agent_run(
         entry = {"role": "user", "content": message_text, "timestamp": timestamp}
         if platform_message_id:
             entry["message_id"] = str(platform_message_id)
-        return [entry], False
+        return [entry], bool(session_db_available)
 
     def _is_compaction_summary_content(content: Any) -> bool:
         if not isinstance(content, str):
@@ -9005,7 +9005,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
             # The agent already persisted these messages to SQLite via
             # _flush_messages_to_session_db(), so skip the DB write here
-            # to prevent the duplicate-write bug (#860 / #42039).
+            # to prevent the duplicate-write bug (#860 / #42039).  We still
+            # write to JSONL for backward compatibility and as a backup.
             agent_persisted = self._session_db is not None
 
             # Find only the NEW messages from this turn (skip history we loaded).
@@ -9033,7 +9034,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text=message_text,
                     timestamp=ts,
                     platform_message_id=event.message_id,
-                    session_db_available=self._session_db is not None,
+                    session_db_available=agent_persisted,
                 )
                 for _row in _rows_to_persist:
                     self.session_store.append_to_transcript(
@@ -9075,7 +9076,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             message_text=message_text,
                             timestamp=ts,
                             platform_message_id=event.message_id,
-                            session_db_available=self._session_db is not None,
+                            session_db_available=agent_persisted,
                         )
                         for _row in _rows_to_persist:
                             self.session_store.append_to_transcript(
@@ -9107,7 +9108,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 session_entry.session_id, entry,
                                 skip_db=agent_persisted,
                             )
-            
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
             # compression decisions.
