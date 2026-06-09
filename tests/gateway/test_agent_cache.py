@@ -501,6 +501,81 @@ class TestAgentCacheLifecycle:
             assert "session-A" not in runner._agent_cache
             assert "session-B" in runner._agent_cache
 
+    def test_evict_releases_cached_agent_when_cache_lock_is_missing(self, monkeypatch):
+        """Test fixtures with no cache lock should still pop and soft-release."""
+        from gateway import run as gw_run
+
+        runner = _make_runner()
+        runner._agent_cache_lock = None
+        runner._running_agents = {}
+        agent = MagicMock()
+        release_calls = []
+        runner._release_evicted_agent_soft = lambda a: release_calls.append(a)
+
+        class _ImmediateThread:
+            def __init__(self, *, target, args=(), **_kwargs):
+                self.target = target
+                self.args = args
+            def start(self):
+                self.target(*self.args)
+
+        monkeypatch.setattr(gw_run.threading, "Thread", _ImmediateThread)
+        runner._agent_cache["session-A"] = (agent, "sig-A")
+
+        runner._evict_cached_agent("session-A")
+
+        assert "session-A" not in runner._agent_cache
+        assert release_calls == [agent]
+
+    def test_evict_does_not_release_agent_that_is_still_running(self, monkeypatch):
+        """Evicting the cache entry must not tear down an active turn's client."""
+        from gateway import run as gw_run
+
+        runner = _make_runner()
+        agent = MagicMock()
+        runner._running_agents = {"session-A": agent}
+        release_calls = []
+        runner._release_evicted_agent_soft = lambda a: release_calls.append(a)
+
+        class _ImmediateThread:
+            def __init__(self, *, target, args=(), **_kwargs):
+                self.target = target
+                self.args = args
+            def start(self):
+                self.target(*self.args)
+
+        monkeypatch.setattr(gw_run.threading, "Thread", _ImmediateThread)
+        with runner._agent_cache_lock:
+            runner._agent_cache["session-A"] = (agent, "sig-A")
+
+        runner._evict_cached_agent("session-A")
+
+        assert "session-A" not in runner._agent_cache
+        assert release_calls == []
+
+    def test_evict_falls_back_to_inline_soft_release_when_thread_spawn_fails(self, monkeypatch):
+        """Interpreter shutdown can reject new threads; evict still releases best-effort."""
+        from gateway import run as gw_run
+
+        runner = _make_runner()
+        runner._running_agents = {}
+        agent = MagicMock()
+        release_calls = []
+        runner._release_evicted_agent_soft = lambda a: release_calls.append(a)
+
+        class _FailingThread:
+            def __init__(self, **_kwargs):
+                raise RuntimeError("no new threads")
+
+        monkeypatch.setattr(gw_run.threading, "Thread", _FailingThread)
+        with runner._agent_cache_lock:
+            runner._agent_cache["session-A"] = (agent, "sig-A")
+
+        runner._evict_cached_agent("session-A")
+
+        assert "session-A" not in runner._agent_cache
+        assert release_calls == [agent]
+
     def test_reasoning_config_updates_in_place(self):
         """Reasoning config can be set on a cached agent without eviction."""
         from run_agent import AIAgent
