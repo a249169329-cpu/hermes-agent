@@ -1225,7 +1225,7 @@ def run_oauth_setup_token() -> Optional[str]:
     # concern does not apply to an interactive login the user explicitly
     # invokes.  noqa: subprocess-stdin
     try:
-        subprocess.run([claude_path, "setup-token"], stdin=subprocess.DEVNULL)
+        subprocess.run([claude_path, "setup-token"])
     except (KeyboardInterrupt, EOFError):
         return None
 
