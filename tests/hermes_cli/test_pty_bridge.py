@@ -281,6 +281,37 @@ class TestPtyBridgeClose:
 
         assert sent == [signal.SIGHUP]
 
+    def test_close_falls_back_to_single_process_signal_when_killpg_fails(self, monkeypatch):
+        sent: list[signal.Signals] = []
+
+        class _FakeProc:
+            pid = 12345
+            fd = -1
+
+            def __init__(self):
+                self.alive = True
+
+            def isalive(self):
+                return self.alive
+
+            def kill(self, sig):
+                sent.append(sig)
+                self.alive = False
+
+            def close(self, force=False):
+                self.closed = force
+
+        monkeypatch.setattr(os, "getpgid", lambda pid: 67890)
+        monkeypatch.setattr(os, "killpg", lambda pgid, sig: (_ for _ in ()).throw(OSError()))
+
+        bridge = PtyBridge.__new__(PtyBridge)
+        bridge._proc = _FakeProc()
+        bridge._fd = -1
+        bridge._closed = False
+
+        bridge.close()
+
+        assert sent == [signal.SIGHUP]
 
 @skip_on_windows
 class TestPtyBridgeEnv:
