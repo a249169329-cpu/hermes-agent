@@ -172,6 +172,17 @@ def test_dockerfile_preinstalls_gateway_messaging_dependencies(dockerfile_text):
     )
 
 
+def test_dockerfile_does_not_preinstall_matrix_dependencies(dockerfile_text):
+    instructions = _instruction_text(dockerfile_text)
+
+    forbidden = ("--extra matrix", "libolm-dev", "python-olm")
+    for token in forbidden:
+        assert token not in instructions, (
+            "Self-use runtime Docker images must not preload Matrix-only "
+            f"dependencies after the Matrix extra was removed: {token}"
+        )
+
+
 def test_dockerfile_preinstalls_hindsight_memory_dependency(dockerfile_text):
     sync_steps = [
         step for step in _run_steps(dockerfile_text)
