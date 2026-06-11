@@ -436,6 +436,19 @@ hermes config set skills.config.myplugin.path ~/myplugin-data
 
 有关在您自己的技能中声明配置设置的详细信息，请参阅[创建技能 — 配置设置](/developer-guide/creating-skills#config-settings-configyaml)。
 
+### 禁用全新技能创建
+
+如果你希望现有技能仍可维护，但全新技能目录必须通过显式 opt-in 流程才能创建，可以设置
+`skills.allow_create: false`。关闭后，`skill_manage(action="create")` 会返回错误；
+`patch`、`edit`、`write_file`、`remove_file` 和 `delete` 仍保留各自原有控制。
+
+```yaml
+skills:
+  allow_create: false   # 默认：true
+```
+
+适用于 agent 可以建议创建技能，但用户希望只在明确批准后才临时开启创建权限的 profile。
+
 ### Agent 创建技能写入的守卫
 
 当 agent 使用 `skill_manage` 创建、编辑、修补或删除技能时，Hermes 可以选择扫描新/更新的内容以查找危险关键字模式（凭据收集、明显的 prompt 注入、数据外泄指令）。扫描器**默认关闭** —— 合法触及 `~/.ssh/` 或提及 `$OPENAI_API_KEY` 的真实 agent 工作流触发启发式规则过于频繁。如果您希望扫描器在 agent 的技能写入落地前提示您，请重新开启：
