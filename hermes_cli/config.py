@@ -1805,6 +1805,11 @@ DEFAULT_CONFIG = {
         "inline_shell": False,
         # Timeout (seconds) for each !`cmd` snippet when inline_shell is on.
         "inline_shell_timeout": 10,
+        # Allow agent/tool callers to create brand-new user-local skills via
+        # skill_manage(action="create"). Set to false for profiles where skill
+        # creation must be an explicit opt-in workflow; patch/edit/write_file
+        # for existing skills remain available.
+        "allow_create": True,
         # Run the keyword/pattern security scanner on skills the agent
         # writes via skill_manage (create/edit/patch).  Off by default
         # because the agent can already execute the same code paths via

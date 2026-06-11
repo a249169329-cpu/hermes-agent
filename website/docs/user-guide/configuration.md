@@ -522,6 +522,21 @@ hermes config set skills.config.myplugin.path ~/myplugin-data
 
 For details on declaring config settings in your own skills, see [Creating Skills — Config Settings](/developer-guide/creating-skills#config-settings-configyaml).
 
+### Disable brand-new skill creation
+
+Set `skills.allow_create: false` when you want existing skills to remain editable
+but brand-new skill directories to require an explicit opt-in workflow. When this
+flag is off, `skill_manage(action="create")` returns an error; `patch`, `edit`,
+`write_file`, `remove_file`, and `delete` keep their existing controls.
+
+```yaml
+skills:
+  allow_create: false   # default: true
+```
+
+This is useful for profiles where the agent may suggest a new skill, but the
+user wants to enable creation only after explicit approval.
+
 ### Guard on agent-created skill writes
 
 When the agent uses `skill_manage` to create, edit, patch, or delete a skill, Hermes can optionally scan the new/updated content for dangerous keyword patterns (credential harvesting, obvious prompt injection, exfil instructions). The scanner is **off by default** — real agent workflows that legitimately touch `~/.ssh/` or mention `$OPENAI_API_KEY` were tripping the heuristic too often. Turn it back on if you want the scanner to prompt you before the agent's skill writes land:

@@ -18,17 +18,23 @@ from tools.skill_manager_tool import (
     _delete_skill,
     _write_file,
     _remove_file,
+    _skill_create_enabled,
     skill_manage,
     MAX_NAME_LENGTH,
 )
 
 
 @contextmanager
-def _skill_dir(tmp_path):
-    """Patch both SKILLS_DIR and get_all_skills_dirs so _find_skill searches
-    only the temp directory — not the real ~/.hermes/skills/."""
+def _skill_dir(tmp_path, *, allow_create=True):
+    """Patch skill lookups into a temp directory and isolate create gating.
+
+    Most tests exercise skill mechanics, not the user's live config. Default to
+    allowing create so a profile-level hard lock does not leak into unit tests;
+    tests for the gate opt out with allow_create=False.
+    """
     with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
-         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]), \
+         patch("tools.skill_manager_tool._skill_create_enabled", return_value=allow_create):
         yield
 
 
@@ -538,6 +544,34 @@ class TestSkillManageDispatcher:
         assert result["success"] is False
         assert "content" in result["error"].lower()
 
+    def test_create_disabled_by_config_gate(self, tmp_path):
+        with _skill_dir(tmp_path, allow_create=False):
+            raw = skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "skills.allow_create=false" in result["error"]
+        assert not (tmp_path / "test-skill").exists()
+
+    def test_create_disabled_gate_takes_precedence_over_missing_content(self, tmp_path):
+        with _skill_dir(tmp_path, allow_create=False):
+            raw = skill_manage(action="create", name="test-skill")
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "skills.allow_create=false" in result["error"]
+
+    def test_patch_still_allowed_when_create_disabled(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+        with _skill_dir(tmp_path, allow_create=False):
+            raw = skill_manage(
+                action="patch",
+                name="test-skill",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the patched thing.",
+            )
+        result = json.loads(raw)
+        assert result["success"] is True
+
     def test_patch_without_old_string(self, tmp_path):
         with _skill_dir(tmp_path):
             raw = skill_manage(action="patch", name="test")
@@ -599,6 +633,26 @@ class TestSkillManageDispatcher:
         result = json.loads(raw)
         assert result["success"] is False
         assert "does not exist" in result["error"]
+
+
+class TestSkillCreateGate:
+    def test_create_gate_defaults_enabled(self):
+        with patch("hermes_cli.config.load_config", return_value={"skills": {}}):
+            assert _skill_create_enabled() is True
+
+    def test_create_gate_reads_false(self):
+        for value in (False, "false", "False", "0", "no", "off"):
+            with patch("hermes_cli.config.load_config", return_value={"skills": {"allow_create": value}}):
+                assert _skill_create_enabled() is False
+
+    def test_create_gate_reads_true(self):
+        for value in (True, "true", "True", "1", "yes", "on"):
+            with patch("hermes_cli.config.load_config", return_value={"skills": {"allow_create": value}}):
+                assert _skill_create_enabled() is True
+
+    def test_create_gate_fail_open_on_config_error(self):
+        with patch("hermes_cli.config.load_config", side_effect=RuntimeError("boom")):
+            assert _skill_create_enabled() is True
 
 
 class TestSecurityScanGate:
