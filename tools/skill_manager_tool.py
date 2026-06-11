@@ -75,6 +75,24 @@ def _guard_agent_created_enabled() -> bool:
         return False
 
 
+def _skill_create_enabled() -> bool:
+    """Read skills.allow_create from config (default True).
+
+    This is a hard safety gate for users who want skill creation to be an
+    explicit opt-in operation.  Patch/edit/write_file/delete keep their own
+    existing controls; only brand-new skill directories are blocked.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        return is_truthy_value(
+            cfg_get(cfg, "skills", "allow_create"),
+            default=True,
+        )
+    except Exception:
+        return True
+
+
 def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     """Scan a skill directory after write. Returns error string if blocked, else None.
 
@@ -922,6 +940,14 @@ def skill_manage(
         return gate_result
 
     if action == "create":
+        if not _skill_create_enabled():
+            return tool_error(
+                "Skill creation is disabled by config (skills.allow_create=false). "
+                "Ask the user to explicitly enable skill creation before calling "
+                "skill_manage(action='create'). Patch/edit/write_file existing "
+                "skills instead when appropriate.",
+                success=False,
+            )
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
         result = _create_skill(name, content, category)
@@ -1007,7 +1033,10 @@ SKILL_MANAGE_SCHEMA = {
         "exist — create/patch the umbrella first, then delete.\n\n"
         "Create when: complex task succeeded (5+ calls), errors overcome, "
         "user-corrected approach worked, non-trivial workflow discovered, "
-        "or user asks you to remember a procedure.\n"
+        "or user asks you to remember a procedure. "
+        "If skills.allow_create=false, action='create' is blocked at runtime; "
+        "ask the user to explicitly enable skill creation first, or patch/write "
+        "files under an existing skill when appropriate.\n"
         "Update when: instructions stale/wrong, OS-specific failures, "
         "missing steps or pitfalls found during use. "
         "If you used a skill and hit issues not covered by it, patch it immediately.\n\n"
