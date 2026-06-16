@@ -8,7 +8,7 @@ from typing import Any
 from tools.registry import registry
 
 
-_SUPPORTED_MODES = {"dry_run_plan", "prepare_goal", "launch_goal"}
+_SUPPORTED_MODES = {"dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal"}
 _SUPPORTED_DIRTY_POLICY = "require-clean"
 _DRIVER = "codex_tui_goal"
 _DEFAULT_ARTIFACT_ROOT = Path("/tmp/hermes-codex-goals")
@@ -319,6 +319,14 @@ def _coerce_timeout_seconds(value: Any) -> int:
     return 600
 
 
+def _coerce_positive_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return max(minimum, min(value, maximum))
+    return default
+
+
 def _launch_goal_tui(
     *,
     workdir: str,
@@ -357,6 +365,112 @@ def _write_goal_input(*, session_id: str, data: str) -> dict[str, Any]:
     return {"written": False, "status": "mock_write_only", "session_id": session_id, "chars": len(data)}
 
 
+def _poll_goal_session(*, session_id: str, wait_seconds: int) -> dict[str, Any]:
+    """Mockable monitor hook. Default performs no process, terminal, or TUI work."""
+    return {
+        "session_id": session_id,
+        "status": "running",
+        "still_running": True,
+        "exit_code": None,
+        "new_output": "",
+        "wait_seconds": wait_seconds,
+    }
+
+
+def _monitor_goal_session(args: dict[str, Any]) -> dict[str, Any]:
+    session_id = str(args.get("session_id") or "").strip()
+    interval = _coerce_positive_int(args.get("monitor_interval_seconds"), default=30, minimum=1, maximum=300)
+    max_windows = _coerce_positive_int(args.get("max_wait_windows"), default=3, minimum=1, maximum=20)
+
+    last_output = ""
+    idle_windows = 0
+    for window in range(1, max_windows + 1):
+        poll = _poll_goal_session(session_id=session_id, wait_seconds=interval)
+        output = str(poll.get("new_output") or "")
+        if output:
+            last_output = output
+            idle_windows = 0
+        else:
+            idle_windows += 1
+
+        status = str(poll.get("status") or "")
+        still_running = bool(poll.get("still_running", status == "running"))
+        if status == "completed" or (not still_running and poll.get("exit_code") == 0):
+            return {
+                "result_status": "completed",
+                "classification": "monitoring",
+                "candidate_disposition": "needs_review",
+                "next_action": "collect_candidate_for_hermes_review",
+                "monitor": {
+                    "session_id": session_id,
+                    "state": "completed",
+                    "wait_windows": window,
+                    "idle_windows": idle_windows,
+                    "max_wait_windows": max_windows,
+                    "monitor_interval_seconds": interval,
+                    "exit_code": poll.get("exit_code"),
+                    "last_output": last_output,
+                },
+            }
+        if status == "failed" or (not still_running and poll.get("exit_code") not in (None, 0)):
+            return {
+                "result_status": "failed",
+                "classification": "blocked",
+                "candidate_disposition": "needs_review",
+                "next_action": "inspect_goal_failure",
+                "monitor": {
+                    "session_id": session_id,
+                    "state": "failed",
+                    "wait_windows": window,
+                    "idle_windows": idle_windows,
+                    "max_wait_windows": max_windows,
+                    "monitor_interval_seconds": interval,
+                    "exit_code": poll.get("exit_code"),
+                    "last_output": last_output,
+                },
+            }
+
+    if last_output and idle_windows == 0:
+        return {
+            "result_status": "running",
+            "classification": "monitoring",
+            "candidate_disposition": "running",
+            "next_action": "continue_monitoring_goal",
+            "monitor": {
+                "session_id": session_id,
+                "state": "running",
+                "wait_windows": max_windows,
+                "idle_windows": 0,
+                "max_wait_windows": max_windows,
+                "monitor_interval_seconds": interval,
+                "last_output": last_output,
+            },
+        }
+
+    monitor = {
+        "session_id": session_id,
+        "state": "idle",
+        "wait_windows": max_windows,
+        "idle_windows": idle_windows,
+        "max_wait_windows": max_windows,
+        "monitor_interval_seconds": interval,
+        "message": (
+            f"No new output for {idle_windows}/{max_windows} wait windows; "
+            "goal may still be running or waiting for attention."
+        ),
+        "recommendation": "continue_monitoring_or_inspect_tui",
+    }
+    if last_output:
+        monitor["last_output"] = last_output
+    return {
+        "result_status": "idle_wait",
+        "classification": "monitoring",
+        "candidate_disposition": "running",
+        "next_action": "continue_monitoring_or_inspect_tui",
+        "monitor": monitor,
+    }
+
+
 def _validate_required(args: dict[str, Any]) -> str | None:
     for field in ("workdir", "stage_id", "objective", "mode", "dirty_baseline_policy"):
         value = args.get(field)
@@ -379,9 +493,9 @@ def codex_goal_run(args: dict[str, Any]) -> str:
                 stage_id=args.get("stage_id"),
                 preflight={"status": "not_run", "blockers": ["unsupported_mode"]},
                 classification="rejected",
-                next_action="use_dry_run_plan_prepare_goal_or_launch_goal",
+                next_action="use_dry_run_plan_prepare_goal_launch_goal_or_monitor_goal",
                 candidate_disposition="planning_only",
-                reason="Supported modes are dry_run_plan, prepare_goal, and launch_goal.",
+                reason="Supported modes are dry_run_plan, prepare_goal, launch_goal, and monitor_goal.",
             )
         )
 
@@ -428,6 +542,62 @@ def codex_goal_run(args: dict[str, Any]) -> str:
         )
 
     dirty = _dirty_check(repo)
+    plan = {
+        "driver": _DRIVER,
+        "launch_method": "official Codex TUI /goal",
+        "not_used": ["codex exec", "codex-yuna exec"],
+        "would_write_goal_files": mode == "prepare_goal",
+        "scope": {
+            "allowed_files": _string_list(args.get("allowed_files")),
+            "allowed_globs": _string_list(args.get("allowed_globs")),
+        },
+        "docs_to_read": _string_list(args.get("docs_to_read")),
+        "stop_conditions": _string_list(args.get("stop_conditions")),
+    }
+
+    if mode == "monitor_goal":
+        session_id = str(args.get("session_id") or "").strip()
+        preflight = {
+            "status": "monitoring",
+            "blockers": [],
+            "dirty_check": dirty,
+            "codex": {"status": "not_run", "reason": "monitor_goal_mock_only"},
+        }
+        if not session_id:
+            return _json_result(
+                _base_result(
+                    status="missing_session_id",
+                    mode=mode,
+                    workdir=repo,
+                    stage_id=args.get("stage_id"),
+                    preflight={**preflight, "blockers": ["missing_session_id"]},
+                    classification="blocked",
+                    next_action="provide_session_id_from_launch_goal",
+                    candidate_disposition="planning_only",
+                    dirty_baseline_policy=dirty_policy,
+                    git_head=git_head,
+                    plan=plan,
+                )
+            )
+
+        monitor_result = _monitor_goal_session({**args, "session_id": session_id})
+        return _json_result(
+            _base_result(
+                status=monitor_result["result_status"],
+                mode=mode,
+                workdir=repo,
+                stage_id=args.get("stage_id"),
+                preflight=preflight,
+                classification=monitor_result["classification"],
+                next_action=monitor_result["next_action"],
+                candidate_disposition=monitor_result["candidate_disposition"],
+                dirty_baseline_policy=dirty_policy,
+                git_head=git_head,
+                plan=plan,
+                monitor=monitor_result["monitor"],
+            )
+        )
+
     if not dirty["is_clean"]:
         return _json_result(
             _base_result(
@@ -449,18 +619,6 @@ def codex_goal_run(args: dict[str, Any]) -> str:
         "blockers": codex_preflight.get("blockers", []),
         "codex": codex_preflight,
         "dirty_check": dirty,
-    }
-    plan = {
-        "driver": _DRIVER,
-        "launch_method": "official Codex TUI /goal",
-        "not_used": ["codex exec", "codex-yuna exec"],
-        "would_write_goal_files": mode == "prepare_goal",
-        "scope": {
-            "allowed_files": _string_list(args.get("allowed_files")),
-            "allowed_globs": _string_list(args.get("allowed_globs")),
-        },
-        "docs_to_read": _string_list(args.get("docs_to_read")),
-        "stop_conditions": _string_list(args.get("stop_conditions")),
     }
 
     if mode == "dry_run_plan":
@@ -608,7 +766,8 @@ _SCHEMA = {
     "description": (
         "Prepare or dry-run an official Codex TUI `/goal` handoff for candidate "
         "implementation work. Slice 2 can exercise a mock PTY launch lifecycle, "
-        "but the default launcher never starts Codex TUI and never calls raw `codex exec`."
+        "and Slice 3 can exercise a mock monitor_goal wait-window state machine. "
+        "The default hooks never start Codex TUI and never call raw `codex exec`."
     ),
     "parameters": {
         "type": "object",
@@ -622,7 +781,7 @@ _SCHEMA = {
             "non_goals": {"type": "array", "items": {"type": "string"}},
             "required_verification": {"type": "array", "items": {"type": "string"}},
             "stop_conditions": {"type": "array", "items": {"type": "string"}},
-            "mode": {"type": "string", "enum": ["dry_run_plan", "prepare_goal", "launch_goal"]},
+            "mode": {"type": "string", "enum": ["dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal"]},
             "dirty_baseline_policy": {"type": "string", "enum": ["require-clean"]},
             "allow_isolated_worktree": {"type": "boolean"},
             "goal_artifact_dir": {"type": "string"},

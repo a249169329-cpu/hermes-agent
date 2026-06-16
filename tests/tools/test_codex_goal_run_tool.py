@@ -3,7 +3,6 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import toolsets
 from tools import codex_goal_run_tool as tool
 from tools.registry import registry
@@ -82,7 +81,7 @@ def test_schema_registration_and_toolset_exposure():
         "mode",
         "dirty_baseline_policy",
     ]
-    assert props["mode"]["enum"] == ["dry_run_plan", "prepare_goal", "launch_goal"]
+    assert props["mode"]["enum"] == ["dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal"]
     assert props["standing_authorization"]["type"] == "boolean"
     assert "codex_goal_run" in toolsets._HERMES_CORE_TOOLS
     assert toolsets.TOOLSETS["codex_goal_run"]["tools"] == ["codex_goal_run"]
@@ -223,7 +222,6 @@ def test_dirty_worktree_blocks_without_artifact_writes(tmp_path, monkeypatch):
     assert not artifact_dir.exists()
 
 
-@pytest.mark.xfail(reason="Slice 3 pending: monitor_goal is not schema-exposed yet", strict=True)
 def test_monitor_goal_mode_is_schema_exposed():
     schema = registry.get_schema("codex_goal_run")
 
@@ -236,7 +234,6 @@ def test_monitor_goal_mode_is_schema_exposed():
     ]
 
 
-@pytest.mark.xfail(reason="Slice 3 pending: idle wait-window composer is not implemented yet", strict=True)
 def test_monitor_goal_idle_wait_composes_bounded_windows_without_real_tui(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
     polls = []
@@ -289,7 +286,36 @@ def test_monitor_goal_idle_wait_composes_bounded_windows_without_real_tui(tmp_pa
     assert _git(repo, "status", "--porcelain") == ""
 
 
-@pytest.mark.xfail(reason="Slice 3 pending: completed monitor state is not implemented yet", strict=True)
+def test_monitor_goal_running_output_is_not_reported_as_idle(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    outputs = ["working 1", "working 2", "working 3"]
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+
+    def fake_poll_goal_session(*, session_id, wait_seconds):
+        return {
+            "session_id": session_id,
+            "status": "running",
+            "still_running": True,
+            "exit_code": None,
+            "new_output": outputs.pop(0),
+        }
+
+    monkeypatch.setattr(tool, "_poll_goal_session", fake_poll_goal_session, raising=False)
+
+    result = json.loads(
+        tool.codex_goal_run(_args(repo, mode="monitor_goal", session_id="session-1", max_wait_windows=3))
+    )
+
+    assert result["status"] == "running"
+    assert result["classification"] == "monitoring"
+    assert result["candidate_disposition"] == "running"
+    assert result["next_action"] == "continue_monitoring_goal"
+    assert result["monitor"]["state"] == "running"
+    assert result["monitor"]["idle_windows"] == 0
+    assert result["monitor"]["wait_windows"] == 3
+    assert result["monitor"]["last_output"] == "working 3"
+
+
 def test_monitor_goal_reports_completed_candidate_without_trusting_completion(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
     events = [
@@ -315,7 +341,6 @@ def test_monitor_goal_reports_completed_candidate_without_trusting_completion(tm
     assert _git(repo, "status", "--porcelain") == ""
 
 
-@pytest.mark.xfail(reason="Slice 3 pending: failed monitor state is not implemented yet", strict=True)
 def test_monitor_goal_reports_failed_exit_without_trusting_completion(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
     monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
@@ -344,7 +369,35 @@ def test_monitor_goal_reports_failed_exit_without_trusting_completion(tmp_path, 
     assert result["monitor"]["last_output"] == "boom"
 
 
-@pytest.mark.xfail(reason="Slice 3 pending: monitor_goal session validation is not implemented yet", strict=True)
+def test_monitor_goal_allows_dirty_candidate_worktree_as_monitor_evidence(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.txt").write_text("candidate diff\n", encoding="utf-8")
+
+    def fail_preflight():
+        raise AssertionError("monitor_goal should not run Codex goals preflight")
+
+    monkeypatch.setattr(tool, "_codex_goals_preflight", fail_preflight)
+    monkeypatch.setattr(
+        tool,
+        "_poll_goal_session",
+        lambda **kwargs: {
+            "session_id": "session-1",
+            "status": "completed",
+            "still_running": False,
+            "exit_code": 0,
+            "new_output": "candidate complete",
+        },
+        raising=False,
+    )
+
+    result = json.loads(tool.codex_goal_run(_args(repo, mode="monitor_goal", session_id="session-1")))
+
+    assert result["status"] == "completed"
+    assert result["preflight"]["dirty_check"]["is_clean"] is False
+    assert result["preflight"]["dirty_check"]["dirty_paths"] == ["candidate.txt"]
+    assert result["next_action"] == "collect_candidate_for_hermes_review"
+
+
 def test_monitor_goal_requires_session_id_before_polling(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
     polls = []
