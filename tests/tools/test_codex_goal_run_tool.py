@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import toolsets
 from tools import codex_goal_run_tool as tool
 from tools.registry import registry
@@ -222,31 +223,140 @@ def test_dirty_worktree_blocks_without_artifact_writes(tmp_path, monkeypatch):
     assert not artifact_dir.exists()
 
 
-def test_unsupported_monitor_goal_blocks_without_subprocess(monkeypatch):
-    calls = []
+@pytest.mark.xfail(reason="Slice 3 pending: monitor_goal is not schema-exposed yet", strict=True)
+def test_monitor_goal_mode_is_schema_exposed():
+    schema = registry.get_schema("codex_goal_run")
 
-    def fake_run(*args, **kwargs):
-        calls.append((args, kwargs))
-        raise AssertionError("unsupported mode must not call subprocess")
+    assert schema is not None
+    assert schema["parameters"]["properties"]["mode"]["enum"] == [
+        "dry_run_plan",
+        "prepare_goal",
+        "launch_goal",
+        "monitor_goal",
+    ]
 
-    monkeypatch.setattr(tool.subprocess, "run", fake_run)
+
+@pytest.mark.xfail(reason="Slice 3 pending: idle wait-window composer is not implemented yet", strict=True)
+def test_monitor_goal_idle_wait_composes_bounded_windows_without_real_tui(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    polls = []
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+
+    def fake_poll_goal_session(*, session_id, wait_seconds):
+        polls.append({"session_id": session_id, "wait_seconds": wait_seconds})
+        return {
+            "session_id": session_id,
+            "status": "running",
+            "still_running": True,
+            "exit_code": None,
+            "new_output": "",
+        }
+
+    monkeypatch.setattr(tool, "_poll_goal_session", fake_poll_goal_session, raising=False)
 
     result = json.loads(
         tool.codex_goal_run(
-            {
-                "workdir": "/tmp/repo",
-                "stage_id": "slice-3",
-                "objective": "Monitor a goal",
-                "mode": "monitor_goal",
-                "dirty_baseline_policy": "require-clean",
-            }
+            _args(
+                repo,
+                mode="monitor_goal",
+                session_id="session-1",
+                monitor_interval_seconds=2,
+                max_wait_windows=3,
+            )
         )
     )
 
-    assert result["status"] == "unsupported_mode"
-    assert result["preflight"]["status"] == "not_run"
-    assert result["next_action"] == "use_dry_run_plan_prepare_goal_or_launch_goal"
-    assert calls == []
+    assert result["status"] == "idle_wait"
+    assert result["classification"] == "monitoring"
+    assert result["candidate_disposition"] == "running"
+    assert result["next_action"] == "continue_monitoring_or_inspect_tui"
+    assert result["completion_trusted"] is False
+    assert result["monitor"] == {
+        "session_id": "session-1",
+        "state": "idle",
+        "wait_windows": 3,
+        "idle_windows": 3,
+        "max_wait_windows": 3,
+        "monitor_interval_seconds": 2,
+        "message": "No new output for 3/3 wait windows; goal may still be running or waiting for attention.",
+        "recommendation": "continue_monitoring_or_inspect_tui",
+    }
+    assert polls == [
+        {"session_id": "session-1", "wait_seconds": 2},
+        {"session_id": "session-1", "wait_seconds": 2},
+        {"session_id": "session-1", "wait_seconds": 2},
+    ]
+    assert _git(repo, "status", "--porcelain") == ""
+
+
+@pytest.mark.xfail(reason="Slice 3 pending: completed monitor state is not implemented yet", strict=True)
+def test_monitor_goal_reports_completed_candidate_without_trusting_completion(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    events = [
+        {"session_id": "session-1", "status": "running", "still_running": True, "exit_code": None, "new_output": "working"},
+        {"session_id": "session-1", "status": "completed", "still_running": False, "exit_code": 0, "new_output": "done"},
+    ]
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+    monkeypatch.setattr(tool, "_poll_goal_session", lambda **kwargs: events.pop(0), raising=False)
+
+    result = json.loads(
+        tool.codex_goal_run(
+            _args(repo, mode="monitor_goal", session_id="session-1", monitor_interval_seconds=1, max_wait_windows=5)
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["completion_trusted"] is False
+    assert result["next_action"] == "collect_candidate_for_hermes_review"
+    assert result["monitor"]["state"] == "completed"
+    assert result["monitor"]["last_output"] == "done"
+    assert result["monitor"]["wait_windows"] == 2
+    assert _git(repo, "status", "--porcelain") == ""
+
+
+@pytest.mark.xfail(reason="Slice 3 pending: failed monitor state is not implemented yet", strict=True)
+def test_monitor_goal_reports_failed_exit_without_trusting_completion(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+    monkeypatch.setattr(
+        tool,
+        "_poll_goal_session",
+        lambda **kwargs: {
+            "session_id": "session-1",
+            "status": "failed",
+            "still_running": False,
+            "exit_code": 2,
+            "new_output": "boom",
+        },
+        raising=False,
+    )
+
+    result = json.loads(tool.codex_goal_run(_args(repo, mode="monitor_goal", session_id="session-1")))
+
+    assert result["status"] == "failed"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["completion_trusted"] is False
+    assert result["next_action"] == "inspect_goal_failure"
+    assert result["monitor"]["state"] == "failed"
+    assert result["monitor"]["exit_code"] == 2
+    assert result["monitor"]["last_output"] == "boom"
+
+
+@pytest.mark.xfail(reason="Slice 3 pending: monitor_goal session validation is not implemented yet", strict=True)
+def test_monitor_goal_requires_session_id_before_polling(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    polls = []
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+    monkeypatch.setattr(tool, "_poll_goal_session", lambda **kwargs: polls.append(kwargs), raising=False)
+
+    result = json.loads(tool.codex_goal_run(_args(repo, mode="monitor_goal", session_id="")))
+
+    assert result["status"] == "missing_session_id"
+    assert result["classification"] == "blocked"
+    assert result["next_action"] == "provide_session_id_from_launch_goal"
+    assert polls == []
 
 
 def test_missing_goals_feature_is_reported_as_preflight_blocker(tmp_path, monkeypatch):
