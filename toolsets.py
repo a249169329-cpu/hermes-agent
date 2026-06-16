@@ -56,7 +56,7 @@ _HERMES_CORE_TOOLS = [
     # Clarifying questions
     "clarify",
     # Code execution + delegation
-    "execute_code", "delegate_task", "codex_workflow_run", "codex_staged_implement",
+    "execute_code", "delegate_task", "codex_workflow_run", "codex_staged_implement", "codex_goal_run",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -254,6 +254,12 @@ TOOLSETS = {
         "tools": ["codex_workflow_run"],
         "includes": []
     },
+
+    "codex_goal_run": {
+        "description": "Prepare official Codex TUI /goal handoffs without launching Codex",
+        "tools": ["codex_goal_run"],
+        "includes": []
+    },
     
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
@@ -400,7 +406,7 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
             "session_search",
-            "execute_code", "delegate_task", "codex_workflow_run", "codex_staged_implement",
+            "execute_code", "delegate_task", "codex_workflow_run", "codex_staged_implement", "codex_goal_run",
         ],
         "includes": []
     },
@@ -428,7 +434,7 @@ TOOLSETS = {
             # Session history search
             "session_search",
             # Code execution + delegation
-            "execute_code", "delegate_task", "codex_workflow_run", "codex_staged_implement",
+            "execute_code", "delegate_task", "codex_workflow_run", "codex_staged_implement", "codex_goal_run",
             # Cronjob management
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
