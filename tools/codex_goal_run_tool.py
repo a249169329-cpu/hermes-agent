@@ -8,7 +8,7 @@ from typing import Any
 from tools.registry import registry
 
 
-_SUPPORTED_MODES = {"dry_run_plan", "prepare_goal"}
+_SUPPORTED_MODES = {"dry_run_plan", "prepare_goal", "launch_goal"}
 _SUPPORTED_DIRTY_POLICY = "require-clean"
 _DRIVER = "codex_tui_goal"
 _DEFAULT_ARTIFACT_ROOT = Path("/tmp/hermes-codex-goals")
@@ -292,6 +292,71 @@ def _write_goal_files(args: dict[str, Any], repo: Path, git_head: str | None) ->
     return {"rich_goal_file": str(rich_path), "one_line_goal_file": str(one_line_path)}
 
 
+def _read_one_line_goal(args: dict[str, Any], repo: Path) -> tuple[str | None, str | None]:
+    goal_file = args.get("one_line_goal_file")
+    if not isinstance(goal_file, str) or not goal_file.strip():
+        return None, "missing_goal_text"
+    goal_path = Path(goal_file).expanduser().resolve()
+    path_error = _artifact_path_error(goal_path, repo)
+    if path_error:
+        return None, path_error
+    try:
+        text = goal_path.read_text(encoding="utf-8")
+    except OSError:
+        return None, "goal_text_not_readable"
+    lines = text.splitlines()
+    if len(lines) != 1:
+        return None, "invalid_goal_text"
+    stripped = lines[0].strip()
+    if not stripped.startswith("/goal ") or not stripped[len("/goal ") :].strip():
+        return None, "invalid_goal_text"
+    return stripped, None
+
+
+def _coerce_timeout_seconds(value: Any) -> int:
+    if isinstance(value, int) and value > 0:
+        return value
+    return 600
+
+
+def _launch_goal_tui(
+    *,
+    workdir: str,
+    command: str,
+    pty: bool,
+    background: bool,
+    notify_on_complete: bool,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Mock-only launch hook for Slice 2.
+
+    The real PTY launcher is intentionally not wired in this slice. Tests may
+    monkeypatch this function to prove lifecycle orchestration without starting
+    Codex TUI.
+    """
+    return {
+        "started": False,
+        "status": "mock_launcher_only",
+        "blockers": ["mock_launcher_only"],
+        "workdir": workdir,
+        "command": command,
+        "pty": pty,
+        "background": background,
+        "notify_on_complete": notify_on_complete,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def _submit_goal_text(*, session_id: str, data: str) -> dict[str, Any]:
+    """Mockable submit hook. Default performs no side effects."""
+    return {"submitted": False, "status": "mock_submit_only", "session_id": session_id, "chars": len(data)}
+
+
+def _write_goal_input(*, session_id: str, data: str) -> dict[str, Any]:
+    """Mockable raw-input hook. Default performs no side effects."""
+    return {"written": False, "status": "mock_write_only", "session_id": session_id, "chars": len(data)}
+
+
 def _validate_required(args: dict[str, Any]) -> str | None:
     for field in ("workdir", "stage_id", "objective", "mode", "dirty_baseline_policy"):
         value = args.get(field)
@@ -314,9 +379,9 @@ def codex_goal_run(args: dict[str, Any]) -> str:
                 stage_id=args.get("stage_id"),
                 preflight={"status": "not_run", "blockers": ["unsupported_mode"]},
                 classification="rejected",
-                next_action="use_dry_run_plan_or_prepare_goal",
+                next_action="use_dry_run_plan_prepare_goal_or_launch_goal",
                 candidate_disposition="planning_only",
-                reason="Slice 1 only supports dry_run_plan and prepare_goal.",
+                reason="Supported modes are dry_run_plan, prepare_goal, and launch_goal.",
             )
         )
 
@@ -388,7 +453,7 @@ def codex_goal_run(args: dict[str, Any]) -> str:
     plan = {
         "driver": _DRIVER,
         "launch_method": "official Codex TUI /goal",
-        "not_used": ["codex exec", "codex-yuna exec", "codex-yuna --enable goals"],
+        "not_used": ["codex exec", "codex-yuna exec"],
         "would_write_goal_files": mode == "prepare_goal",
         "scope": {
             "allowed_files": _string_list(args.get("allowed_files")),
@@ -432,6 +497,76 @@ def codex_goal_run(args: dict[str, Any]) -> str:
             )
         )
 
+    if mode == "launch_goal":
+        goal_text, goal_error = _read_one_line_goal(args, repo)
+        if goal_error:
+            return _json_result(
+                _base_result(
+                    status=goal_error,
+                    mode=mode,
+                    workdir=repo,
+                    stage_id=args.get("stage_id"),
+                    preflight={**preflight, "blockers": [*preflight.get("blockers", []), goal_error]},
+                    classification="blocked",
+                    next_action="provide_single_line_goal_file_under_tmp_outside_repo",
+                    candidate_disposition="planning_only",
+                    dirty_baseline_policy=dirty_policy,
+                    git_head=git_head,
+                    plan=plan,
+                )
+            )
+
+        timeout_seconds = _coerce_timeout_seconds(args.get("timeout_seconds"))
+        command = "codex-yuna --enable goals"
+        launch = _launch_goal_tui(
+            workdir=str(repo),
+            command=command,
+            pty=True,
+            background=True,
+            notify_on_complete=True,
+            timeout_seconds=timeout_seconds,
+        )
+        if not launch.get("started"):
+            blockers = [str(item) for item in launch.get("blockers", ["mock_launcher_only"])]
+            return _json_result(
+                _base_result(
+                    status="launch_unavailable",
+                    mode=mode,
+                    workdir=repo,
+                    stage_id=args.get("stage_id"),
+                    preflight={**preflight, "blockers": [*preflight.get("blockers", []), *blockers]},
+                    classification="blocked",
+                    next_action="wire_real_pty_launcher_or_provide_mock",
+                    candidate_disposition="planning_only",
+                    dirty_baseline_policy=dirty_policy,
+                    git_head=git_head,
+                    plan=plan,
+                    process=launch,
+                )
+            )
+
+        session_id = str(launch.get("session_id") or "")
+        submit = _submit_goal_text(session_id=session_id, data=goal_text or "")
+        raw_enter = _write_goal_input(session_id=session_id, data="\r")
+        return _json_result(
+            _base_result(
+                status="launched",
+                mode=mode,
+                workdir=repo,
+                stage_id=args.get("stage_id"),
+                preflight=preflight,
+                classification="launched_goal",
+                next_action="monitor_goal_wait_windows_then_collect_candidate",
+                candidate_disposition="needs_review",
+                dirty_baseline_policy=dirty_policy,
+                git_head=git_head,
+                plan=plan,
+                process=launch,
+                submit=submit,
+                raw_enter=raw_enter,
+            )
+        )
+
     try:
         goal_files = _write_goal_files(args, repo, git_head)
     except ValueError as exc:
@@ -472,8 +607,8 @@ _SCHEMA = {
     "name": "codex_goal_run",
     "description": (
         "Prepare or dry-run an official Codex TUI `/goal` handoff for candidate "
-        "implementation work. Slice 1 never launches Codex TUI, never calls raw "
-        "`codex exec`, and only supports dry_run_plan or prepare_goal."
+        "implementation work. Slice 2 can exercise a mock PTY launch lifecycle, "
+        "but the default launcher never starts Codex TUI and never calls raw `codex exec`."
     ),
     "parameters": {
         "type": "object",
@@ -487,7 +622,7 @@ _SCHEMA = {
             "non_goals": {"type": "array", "items": {"type": "string"}},
             "required_verification": {"type": "array", "items": {"type": "string"}},
             "stop_conditions": {"type": "array", "items": {"type": "string"}},
-            "mode": {"type": "string", "enum": ["dry_run_plan", "prepare_goal"]},
+            "mode": {"type": "string", "enum": ["dry_run_plan", "prepare_goal", "launch_goal"]},
             "dirty_baseline_policy": {"type": "string", "enum": ["require-clean"]},
             "allow_isolated_worktree": {"type": "boolean"},
             "goal_artifact_dir": {"type": "string"},

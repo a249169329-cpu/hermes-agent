@@ -3,7 +3,6 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import toolsets
 from tools import codex_goal_run_tool as tool
 from tools.registry import registry
@@ -82,7 +81,7 @@ def test_schema_registration_and_toolset_exposure():
         "mode",
         "dirty_baseline_policy",
     ]
-    assert props["mode"]["enum"] == ["dry_run_plan", "prepare_goal"]
+    assert props["mode"]["enum"] == ["dry_run_plan", "prepare_goal", "launch_goal"]
     assert props["standing_authorization"]["type"] == "boolean"
     assert "codex_goal_run" in toolsets._HERMES_CORE_TOOLS
     assert toolsets.TOOLSETS["codex_goal_run"]["tools"] == ["codex_goal_run"]
@@ -223,7 +222,7 @@ def test_dirty_worktree_blocks_without_artifact_writes(tmp_path, monkeypatch):
     assert not artifact_dir.exists()
 
 
-def test_unsupported_launch_goal_blocks_without_subprocess(monkeypatch):
+def test_unsupported_monitor_goal_blocks_without_subprocess(monkeypatch):
     calls = []
 
     def fake_run(*args, **kwargs):
@@ -236,9 +235,9 @@ def test_unsupported_launch_goal_blocks_without_subprocess(monkeypatch):
         tool.codex_goal_run(
             {
                 "workdir": "/tmp/repo",
-                "stage_id": "slice-2",
-                "objective": "Launch a goal",
-                "mode": "launch_goal",
+                "stage_id": "slice-3",
+                "objective": "Monitor a goal",
+                "mode": "monitor_goal",
                 "dirty_baseline_policy": "require-clean",
             }
         )
@@ -246,7 +245,7 @@ def test_unsupported_launch_goal_blocks_without_subprocess(monkeypatch):
 
     assert result["status"] == "unsupported_mode"
     assert result["preflight"]["status"] == "not_run"
-    assert result["next_action"] == "use_dry_run_plan_or_prepare_goal"
+    assert result["next_action"] == "use_dry_run_plan_prepare_goal_or_launch_goal"
     assert calls == []
 
 
@@ -273,7 +272,6 @@ def test_missing_goals_feature_is_reported_as_preflight_blocker(tmp_path, monkey
     assert "missing_goals_feature" in prepare["preflight"]["blockers"]
 
 
-@pytest.mark.xfail(strict=True, reason="Slice 2 launch_goal PTY lifecycle is specified but not implemented yet")
 def test_launch_goal_uses_pty_background_notify_and_raw_enter_without_real_tui(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
     one_line = tmp_path / "slice-2.goal.txt"
@@ -326,7 +324,6 @@ def test_launch_goal_uses_pty_background_notify_and_raw_enter_without_real_tui(t
     assert _git(repo, "status", "--porcelain") == ""
 
 
-@pytest.mark.xfail(strict=True, reason="Slice 2 launch_goal PTY lifecycle is specified but not implemented yet")
 def test_launch_goal_rejects_missing_or_multiline_goal_before_tui_launch(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
     calls = []
@@ -357,3 +354,40 @@ def test_launch_goal_rejects_missing_or_multiline_goal_before_tui_launch(tmp_pat
     )
     assert bad["status"] == "invalid_goal_text"
     assert calls == []
+
+    no_objective = tmp_path / "empty.goal.txt"
+    no_objective.write_text("/goal\n", encoding="utf-8")
+    empty = json.loads(tool.codex_goal_run(_args(repo, mode="launch_goal", one_line_goal_file=str(no_objective))))
+    assert empty["status"] == "invalid_goal_text"
+    assert calls == []
+
+    extra_blank = tmp_path / "extra-blank.goal.txt"
+    extra_blank.write_text("/goal first line\n\n", encoding="utf-8")
+    extra = json.loads(tool.codex_goal_run(_args(repo, mode="launch_goal", one_line_goal_file=str(extra_blank))))
+    assert extra["status"] == "invalid_goal_text"
+    assert calls == []
+
+
+def test_launch_goal_default_launcher_is_disabled_and_side_effect_free(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    one_line = tmp_path / "slice-2.goal.txt"
+    one_line.write_text("/goal Complete Slice 2 only. Stop for Hermes review.\n", encoding="utf-8")
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+
+    result = json.loads(
+        tool.codex_goal_run(
+            _args(
+                repo,
+                mode="launch_goal",
+                one_line_goal_file=str(one_line),
+            )
+        )
+    )
+
+    assert result["status"] == "launch_unavailable"
+    assert "mock_launcher_only" in result["preflight"]["blockers"]
+    assert result["process"]["started"] is False
+    assert result["process"]["pty"] is True
+    assert result["process"]["background"] is True
+    assert result["process"]["notify_on_complete"] is True
+    assert _git(repo, "status", "--porcelain") == ""
