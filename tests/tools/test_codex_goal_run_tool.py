@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import toolsets
 from tools import codex_goal_run_tool as tool
 from tools.registry import registry
@@ -270,3 +271,89 @@ def test_missing_goals_feature_is_reported_as_preflight_blocker(tmp_path, monkey
     assert prepare["status"] == "preflight_blocked"
     assert prepare["goal_files"] == {}
     assert "missing_goals_feature" in prepare["preflight"]["blockers"]
+
+
+@pytest.mark.xfail(strict=True, reason="Slice 2 launch_goal PTY lifecycle is specified but not implemented yet")
+def test_launch_goal_uses_pty_background_notify_and_raw_enter_without_real_tui(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    one_line = tmp_path / "slice-2.goal.txt"
+    one_line.write_text("/goal Complete Slice 2 only. Stop for Hermes review.\n", encoding="utf-8")
+    calls = {}
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+
+    def fake_launch_goal_tui(*, workdir, command, pty, background, notify_on_complete, timeout_seconds):
+        calls["launch"] = {
+            "workdir": workdir,
+            "command": command,
+            "pty": pty,
+            "background": background,
+            "notify_on_complete": notify_on_complete,
+            "timeout_seconds": timeout_seconds,
+        }
+        return {"session_id": "session-1", "started": True, "still_running": True, "exit_code": None}
+
+    def fake_submit_goal_text(*, session_id, data):
+        calls["submit"] = {"session_id": session_id, "data": data}
+
+    def fake_write_goal_input(*, session_id, data):
+        calls["write"] = {"session_id": session_id, "data": data}
+
+    monkeypatch.setattr(tool, "_launch_goal_tui", fake_launch_goal_tui, raising=False)
+    monkeypatch.setattr(tool, "_submit_goal_text", fake_submit_goal_text, raising=False)
+    monkeypatch.setattr(tool, "_write_goal_input", fake_write_goal_input, raising=False)
+
+    result = json.loads(
+        tool.codex_goal_run(
+            _args(
+                repo,
+                mode="launch_goal",
+                one_line_goal_file=str(one_line),
+                timeout_seconds=600,
+            )
+        )
+    )
+
+    assert result["status"] == "launched"
+    assert result["process"]["session_id"] == "session-1"
+    assert calls["launch"]["workdir"] == str(repo)
+    assert "codex-yuna --enable goals" in calls["launch"]["command"]
+    assert "codex-yuna exec" not in calls["launch"]["command"]
+    assert calls["launch"]["pty"] is True
+    assert calls["launch"]["background"] is True
+    assert calls["launch"]["notify_on_complete"] is True
+    assert calls["submit"] == {"session_id": "session-1", "data": "/goal Complete Slice 2 only. Stop for Hermes review."}
+    assert calls["write"] == {"session_id": "session-1", "data": "\r"}
+    assert _git(repo, "status", "--porcelain") == ""
+
+
+@pytest.mark.xfail(strict=True, reason="Slice 2 launch_goal PTY lifecycle is specified but not implemented yet")
+def test_launch_goal_rejects_missing_or_multiline_goal_before_tui_launch(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    calls = []
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+    monkeypatch.setattr(tool, "_launch_goal_tui", lambda **kwargs: calls.append(kwargs), raising=False)
+
+    missing = json.loads(
+        tool.codex_goal_run(
+            _args(
+                repo,
+                mode="launch_goal",
+            )
+        )
+    )
+    assert missing["status"] == "missing_goal_text"
+    assert calls == []
+
+    multiline = tmp_path / "bad.goal.txt"
+    multiline.write_text("/goal first line\nsecond line\n", encoding="utf-8")
+    bad = json.loads(
+        tool.codex_goal_run(
+            _args(
+                repo,
+                mode="launch_goal",
+                one_line_goal_file=str(multiline),
+            )
+        )
+    )
+    assert bad["status"] == "invalid_goal_text"
+    assert calls == []
