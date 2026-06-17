@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import toolsets
 from tools import codex_goal_run_tool as tool
 from tools.registry import registry
@@ -738,6 +739,114 @@ def test_compose_goal_snapshot_replay_feeds_existing_classifier(tmp_path):
     classified = tool._classify_goal_snapshot(snapshot)
     assert classified["result_status"] == "completed"
     assert classified["candidate_evidence"]["untracked_files"] == ["new.py"]
+
+
+@pytest.mark.xfail(reason="Slice 4D pending: adapter stop condition contract is not implemented yet", strict=True)
+def test_goal_adapter_stop_condition_stops_when_candidate_ready():
+    stop = tool._goal_adapter_stop_condition(
+        {
+            "result_status": "completed",
+            "next_action": "collect_candidate_for_hermes_review",
+            "completion_trusted": False,
+        }
+    )
+
+    assert stop == {
+        "should_stop": True,
+        "reason": "candidate_ready_for_review",
+        "completion_trusted": False,
+    }
+
+
+@pytest.mark.xfail(reason="Slice 4D pending: default adapter runner gate is not implemented yet", strict=True)
+def test_run_goal_adapter_once_default_disabled_does_not_call_runners(tmp_path):
+    calls = []
+
+    def forbidden_runner(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("disabled adapter must not call injected runners")
+
+    result = tool._run_goal_adapter_once(
+        session_id="session-1",
+        repo=tmp_path / "missing-repo",
+        wait_seconds=5,
+        process_runner=forbidden_runner,
+        git_runner=forbidden_runner,
+    )
+
+    assert calls == []
+    assert result["status"] == "adapter_disabled"
+    assert result["adapter_status"] == "disabled"
+    assert result["blockers"] == ["real_adapter_disabled"]
+    assert result["snapshot"]["adapter_status"] == {"process": "disabled", "git": "disabled"}
+    assert result["classification"]["result_status"] == "process_missing"
+    assert result["stop_condition"]["should_stop"] is True
+    assert result["completion_trusted"] is False
+
+
+@pytest.mark.xfail(reason="Slice 4D pending: explicit authorization gate is not implemented yet", strict=True)
+def test_run_goal_adapter_once_requires_explicit_authorization_before_runner_calls(tmp_path):
+    calls = []
+
+    def forbidden_runner(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("unauthorized adapter must not call injected runners")
+
+    result = tool._run_goal_adapter_once(
+        session_id="session-1",
+        repo=tmp_path,
+        wait_seconds=5,
+        adapter_enabled=True,
+        allow_real_adapter=False,
+        process_runner=forbidden_runner,
+        git_runner=forbidden_runner,
+    )
+
+    assert calls == []
+    assert result["status"] == "real_adapter_not_authorized"
+    assert result["adapter_status"] == "blocked"
+    assert result["blockers"] == ["real_adapter_not_authorized"]
+    assert result["completion_trusted"] is False
+
+
+@pytest.mark.xfail(reason="Slice 4D pending: injected runner interface is not implemented yet", strict=True)
+def test_run_goal_adapter_once_authorized_injected_runners_feed_classifier(tmp_path):
+    calls = []
+
+    def fake_process_runner(*, session_id, wait_seconds):
+        calls.append(("process", session_id, wait_seconds))
+        return {
+            "process": {"found": True, "still_running": False, "exit_code": 0},
+            "log": {"new_output": "Goal achieved", "raw": "work\nGoal achieved"},
+        }
+
+    def fake_git_runner(*, repo):
+        calls.append(("git", str(repo)))
+        return {"is_clean": False, "changed_files": [], "staged_files": [], "untracked_files": ["new.py"]}
+
+    result = tool._run_goal_adapter_once(
+        session_id="session-1",
+        repo=tmp_path,
+        wait_seconds=5,
+        wait_windows=2,
+        idle_windows=0,
+        adapter_enabled=True,
+        allow_real_adapter=True,
+        process_runner=fake_process_runner,
+        git_runner=fake_git_runner,
+    )
+
+    assert calls == [("process", "session-1", 5), ("git", str(tmp_path))]
+    assert result["status"] == "completed"
+    assert result["adapter_status"] == "injected"
+    assert result["classification"]["result_status"] == "completed"
+    assert result["classification"]["candidate_evidence"]["untracked_files"] == ["new.py"]
+    assert result["stop_condition"] == {
+        "should_stop": True,
+        "reason": "candidate_ready_for_review",
+        "completion_trusted": False,
+    }
+    assert result["completion_trusted"] is False
 
 
 def test_missing_goals_feature_is_reported_as_preflight_blocker(tmp_path, monkeypatch):
