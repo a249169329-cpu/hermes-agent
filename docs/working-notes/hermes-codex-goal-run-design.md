@@ -1,12 +1,38 @@
 # `codex_goal_run` Runtime Driver Design
 
-> 状态：设计文档 / implementation plan，尚未实现。
+> 状态：设计文档 / implementation plan；Slice 1-3 mock-first runtime skeleton 已实现，真实 TUI 尚未接入。
 > 日期：2026-06-16
 > 关联文档：
 > - `docs/working-notes/hermes-codex-division-of-labor.md`
 > - `docs/working-notes/hermes-codex-driver-selection-guarded-vs-goal.md`
+> - `docs/working-notes/hermes-codex-goal-run-slice-handoff.md`
 > - skill：`autonomous-ai-agents/codex-goal-stage-workflow`
 > - skill reference：`codex` / `references/official-goal-mode-codex-cli.md`（通过 `skill_view` 读取，不是 repo 内文件）
+
+## 0. 当前实现快照
+
+截至 2026-06-16，本设计已分三片落地 mock-first 骨架：
+
+| Slice | commit | 覆盖范围 | 真实 TUI |
+|---|---|---|---|
+| Slice 1 | `6ac1dbfb1 feat(codex): add goal run prepare driver` | `dry_run_plan` / `prepare_goal`、schema、preflight、`/tmp` goal artifacts | 否 |
+| Slice 2 | `35f0bfbaf feat(codex): add mock goal launch lifecycle` | `launch_goal` mock lifecycle、one-line goal validation、PTY/background/notify 参数、raw `\r` hook | 否 |
+| Slice 3 | `65dccf854 feat(codex): add mock goal monitor lifecycle` | `monitor_goal` wait-window / idle composer 状态机、dirty candidate evidence、completed/failed/running/idle 分类 | 否 |
+
+详细对照表与 Slice 4 边界计划见：
+
+```text
+docs/working-notes/hermes-codex-goal-run-slice-handoff.md
+```
+
+当前仍然不做：
+
+```text
+不启动真实 Codex TUI。
+不执行真实 `codex-yuna --enable goals`。
+不调用 terminal/process tool 作为 monitor adapter。
+不 push / deploy / restart。
+```
 
 ## 1. 目标
 
@@ -599,14 +625,17 @@ git diff --check HEAD
 - 断言 command 不使用 `codex-yuna exec`；
 - 断言 submit 后有 raw `\r`。
 
-### Slice 3：monitor / candidate evidence
+### Slice 3：monitor / candidate evidence（当前已实现 mock 状态机，candidate evidence 尚未完整实现）
 
 功能：
 
-- wait-window timeout 分类；
-- `Goal achieved` idle composer 分类；
-- git status/diff/untracked evidence；
-- no raw log flood。
+- wait-window timeout 分类；（已实现 mock `idle_wait`）
+- running output 不误报 idle；（已实现）
+- completed / failed / missing session 分类；（已实现）
+- dirty candidate worktree 作为 monitor evidence，不阻塞 monitor；（已实现）
+- `Goal achieved` idle composer 分类；（待 Slice 4/5 接真实 transcript/log evidence）
+- git status/diff/untracked evidence；（待 Slice 4+，当前只暴露 dirty_check evidence）
+- no raw log flood。（待 Slice 4 定义 bounded log tail）
 
 测试：
 
@@ -616,7 +645,25 @@ git diff --check HEAD
 - process exited with diff；
 - untracked files included。
 
-### Slice 4：review handoff integration
+### Slice 4：real adapter contract / replay classifier，不接真实 TUI
+
+功能：
+
+- 定义真实 terminal/process adapter 的 snapshot/evidence shape；
+- 用 replay/mock transcript tests 覆盖 process/log/git evidence → monitor state 映射；
+- 新增纯函数 classifier，例如 process running/output、idle no diff、process exited with diff、pasted content suspected、process missing；
+- 默认仍 disabled/mock-only，不调用真实 terminal/process，不启动 `codex-yuna --enable goals`。
+
+测试：
+
+- running output 不误报 idle；
+- idle no diff 返回 inspect/continue recommendation；
+- process exited 0 + diff 返回 completed + `completion_trusted=false`；
+- process missing 返回 explicit status，不猜；
+- `[Pasted Content]` + no diff 返回 needs_attention / raw enter or ask；
+- untracked-only evidence 不丢。
+
+### Slice 5：review handoff integration
 
 功能：
 
@@ -673,19 +720,22 @@ git diff --check HEAD
 
 ## 19. 下一步建议
 
-若继续进入实现，建议先做 **Slice 1：dry-run / prepare only**。
+若继续进入实现，建议先做 **Slice 4：real adapter contract / replay classifier**。
 
 理由：
 
 ```text
-风险最低，不启动 Codex，不改 repo，只验证 API、preflight 和 artifact 生成。
+Slice 1-3 已完成 mock skeleton。
+下一步应先锁定真实 terminal/process/git evidence 的输入输出契约，仍不启动 Codex TUI。
+等 replay tests 和纯函数 classifier 稳定后，再进入真实 TUI smoke。
 ```
 
-首个实现阶段应停止在：
+下一阶段应停止在：
 
 ```text
-codex_goal_run(mode="dry_run_plan")
-codex_goal_run(mode="prepare_goal")
+replay/mock snapshot tests
+pure classifier for process/log/git evidence
+adapter wrapper contract disabled by default
 ```
 
-不要直接做 `launch_goal`。
+不要直接做真实 `launch_goal` / `codex-yuna --enable goals`。
