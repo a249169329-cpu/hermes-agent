@@ -398,6 +398,114 @@ def _bounded_log_tail(raw: str, *, max_lines: int, max_chars: int) -> dict[str, 
     }
 
 
+def _normalize_goal_process(value: Any) -> dict[str, Any]:
+    process = value if isinstance(value, dict) else {}
+    exit_code = process.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        exit_code = None
+    return {
+        "found": bool(process.get("found", False)),
+        "still_running": bool(process.get("still_running", False)),
+        "exit_code": exit_code,
+    }
+
+
+def _normalize_goal_log(value: Any) -> dict[str, str]:
+    log = value if isinstance(value, dict) else {}
+    return {
+        "new_output": str(log.get("new_output") or ""),
+        "raw": str(log.get("raw") or ""),
+    }
+
+
+def _normalize_goal_git_evidence(repo: Path, value: Any) -> dict[str, Any]:
+    evidence = value if isinstance(value, dict) else {}
+    return {
+        "repo": str(repo),
+        "is_clean": bool(evidence.get("is_clean", True)),
+        "changed_files": _string_list(evidence.get("changed_files")),
+        "staged_files": _string_list(evidence.get("staged_files")),
+        "untracked_files": _string_list(evidence.get("untracked_files")),
+        "diff_stat": str(evidence.get("diff_stat") or ""),
+        "staged_diff_stat": str(evidence.get("staged_diff_stat") or ""),
+    }
+
+
+def _collect_goal_process_snapshot(
+    *,
+    session_id: str,
+    wait_seconds: int,
+    replay_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if isinstance(replay_snapshot, dict):
+        return {
+            "adapter_status": "replay",
+            "session_id": str(session_id),
+            "wait_seconds": wait_seconds,
+            "process": _normalize_goal_process(replay_snapshot.get("process")),
+            "log": _normalize_goal_log(replay_snapshot.get("log")),
+        }
+
+    return {
+        "adapter_status": "disabled",
+        "session_id": str(session_id),
+        "wait_seconds": wait_seconds,
+        "process": {"found": False, "still_running": False, "exit_code": None},
+        "log": {"new_output": "", "raw": ""},
+    }
+
+
+def _collect_goal_git_evidence(
+    *,
+    repo: Path,
+    replay_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if isinstance(replay_evidence, dict):
+        return {
+            "adapter_status": "replay",
+            **_normalize_goal_git_evidence(repo, replay_evidence),
+        }
+
+    return {
+        "adapter_status": "disabled",
+        **_normalize_goal_git_evidence(repo, {}),
+    }
+
+
+def _compose_goal_snapshot(
+    *,
+    session_id: str,
+    repo: Path,
+    wait_seconds: int,
+    wait_windows: int | None = None,
+    idle_windows: int | None = None,
+    process_replay: dict[str, Any] | None = None,
+    git_replay: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    process_snapshot = _collect_goal_process_snapshot(
+        session_id=session_id,
+        wait_seconds=wait_seconds,
+        replay_snapshot=process_replay,
+    )
+    git_evidence = _collect_goal_git_evidence(repo=repo, replay_evidence=git_replay)
+    snapshot = {
+        "session_id": str(session_id),
+        "wait_seconds": wait_seconds,
+        "adapter_status": {
+            "process": process_snapshot["adapter_status"],
+            "git": git_evidence["adapter_status"],
+        },
+        "process": process_snapshot["process"],
+        "log": process_snapshot["log"],
+        "git": git_evidence,
+    }
+    if wait_windows is not None:
+        snapshot["wait_windows"] = wait_windows
+    if idle_windows is not None:
+        snapshot["idle_windows"] = idle_windows
+    return snapshot
+
+
 def _classify_goal_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     session_id = str(snapshot.get("session_id") or "")
     process = snapshot.get("process") if isinstance(snapshot.get("process"), dict) else {}

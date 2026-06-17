@@ -3,7 +3,6 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import toolsets
 from tools import codex_goal_run_tool as tool
 from tools.registry import registry
@@ -657,7 +656,6 @@ def test_classify_goal_snapshot_still_running_clean_idle_returns_idle_wait():
     assert result["monitor"]["state"] == "idle"
 
 
-@pytest.mark.xfail(reason="Slice 4C pending: disabled adapter wrappers are not implemented yet", strict=True)
 def test_goal_snapshot_default_adapters_are_disabled_and_side_effect_free(tmp_path):
     missing_repo = tmp_path / "does-not-exist"
 
@@ -678,7 +676,6 @@ def test_goal_snapshot_default_adapters_are_disabled_and_side_effect_free(tmp_pa
     assert classified["result_status"] == "process_missing"
 
 
-@pytest.mark.xfail(reason="Slice 4C pending: process replay adapter contract is not implemented yet", strict=True)
 def test_collect_goal_process_snapshot_replay_normalizes_process_and_log():
     snapshot = tool._collect_goal_process_snapshot(
         session_id="session-1",
@@ -696,7 +693,6 @@ def test_collect_goal_process_snapshot_replay_normalizes_process_and_log():
     assert snapshot["log"] == {"new_output": "working", "raw": "thinking\nworking"}
 
 
-@pytest.mark.xfail(reason="Slice 4C pending: git replay adapter contract is not implemented yet", strict=True)
 def test_collect_goal_git_evidence_replay_preserves_untracked_and_diff_stats(tmp_path):
     repo = tmp_path / "repo"
     replay = {
@@ -720,7 +716,6 @@ def test_collect_goal_git_evidence_replay_preserves_untracked_and_diff_stats(tmp
     assert evidence["staged_diff_stat"] == "staged.py | 1 +"
 
 
-@pytest.mark.xfail(reason="Slice 4C pending: composed replay snapshot contract is not implemented yet", strict=True)
 def test_compose_goal_snapshot_replay_feeds_existing_classifier(tmp_path):
     repo = tmp_path / "repo"
 
