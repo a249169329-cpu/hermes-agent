@@ -957,11 +957,17 @@ def codex_goal_run(args: dict[str, Any]) -> str:
 
     if mode == "monitor_goal":
         session_id = str(args.get("session_id") or "").strip()
+        adapter_enabled = args.get("adapter_enabled") is True
+        allow_real_adapter = args.get("allow_real_adapter") is True
         preflight = {
             "status": "monitoring",
             "blockers": [],
             "dirty_check": dirty,
-            "codex": {"status": "not_run", "reason": "monitor_goal_mock_only"},
+            "codex": {
+                "status": "not_run",
+                "reason": "monitor_goal_adapter_call_site" if adapter_enabled else "monitor_goal_mock_only",
+                "allow_real_adapter": allow_real_adapter,
+            },
         }
         if not session_id:
             return _json_result(
@@ -977,6 +983,39 @@ def codex_goal_run(args: dict[str, Any]) -> str:
                     dirty_baseline_policy=dirty_policy,
                     git_head=git_head,
                     plan=plan,
+                )
+            )
+
+        if adapter_enabled:
+            interval = _coerce_positive_int(args.get("monitor_interval_seconds"), default=30, minimum=1, maximum=300)
+            adapter_result = _run_goal_adapter_once(
+                session_id=session_id,
+                repo=repo,
+                wait_seconds=interval,
+                wait_windows=1,
+                idle_windows=0,
+                adapter_enabled=True,
+                allow_real_adapter=allow_real_adapter,
+            )
+            classification = (
+                adapter_result.get("classification") if isinstance(adapter_result.get("classification"), dict) else {}
+            )
+            return _json_result(
+                _base_result(
+                    status=str(adapter_result.get("status") or "adapter_error"),
+                    mode=mode,
+                    workdir=repo,
+                    stage_id=args.get("stage_id"),
+                    preflight=preflight,
+                    classification=str(classification.get("classification") or "blocked"),
+                    next_action=str(classification.get("next_action") or "inspect_process_registry"),
+                    candidate_disposition=str(classification.get("candidate_disposition") or "planning_only"),
+                    dirty_baseline_policy=dirty_policy,
+                    git_head=git_head,
+                    plan=plan,
+                    monitor=classification.get("monitor"),
+                    adapter=adapter_result,
+                    completion_trusted=False,
                 )
             )
 
@@ -1192,6 +1231,8 @@ _SCHEMA = {
             "monitor_interval_seconds": {"type": "integer"},
             "max_wait_windows": {"type": "integer"},
             "standing_authorization": {"type": "boolean"},
+            "adapter_enabled": {"type": "boolean"},
+            "allow_real_adapter": {"type": "boolean"},
         },
         "required": ["workdir", "stage_id", "objective", "mode", "dirty_baseline_policy"],
     },
