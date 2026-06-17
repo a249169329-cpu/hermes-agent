@@ -208,7 +208,10 @@ def _normalize_candidate_review_replay(review_replay: dict[str, Any]) -> dict[st
         or unavailable_blockers
         or review_replay.get("review_unusable") is True
     ):
-        blocker = raw_reason if raw_reason in unavailable_markers else raw_status if raw_status in unavailable_markers else unavailable_blockers[0] if unavailable_blockers else "review_unavailable"
+        if raw_status == "review_unavailable" and raw_reason:
+            blocker = raw_reason
+        else:
+            blocker = raw_reason if raw_reason in unavailable_markers else raw_status if raw_status in unavailable_markers else unavailable_blockers[0] if unavailable_blockers else "review_unavailable"
         return {
             "status": "review_unavailable",
             "reason": blocker,
@@ -1561,11 +1564,19 @@ def codex_goal_run(args: dict[str, Any]) -> str:
         review_runner_enabled = args.get("review_runner_enabled") is True
         allow_real_review = args.get("allow_real_review") is True
         review_guard_enabled = args.get("review_guard_enabled") is True
+        review_guard_subprocess_enabled = args.get("review_guard_subprocess_enabled") is True
         review_runner = _REAL_CANDIDATE_REVIEW_RUNNER
         if review_guard_enabled:
+            guard_runner = _REAL_CANDIDATE_REVIEW_GUARD_RUNNER
+            if review_guard_subprocess_enabled:
+                guard_runner = lambda *, prompt, review_packet: _run_candidate_review_guard_subprocess(
+                    prompt=prompt,
+                    review_packet=review_packet,
+                    workdir=repo,
+                )
             review_runner = lambda *, review_packet: _run_candidate_review_guard_adapter(
                 review_packet=review_packet,
-                guard_runner=_REAL_CANDIDATE_REVIEW_GUARD_RUNNER,
+                guard_runner=guard_runner,
             )
         review = _run_candidate_review_once(
             review_handoff=review_handoff,
@@ -1580,6 +1591,8 @@ def codex_goal_run(args: dict[str, Any]) -> str:
             codex_reason = "review_candidate_disabled"
         elif not allow_real_review:
             codex_reason = "review_candidate_not_authorized"
+        elif review_guard_enabled and review_guard_subprocess_enabled:
+            codex_reason = "review_candidate_guard_subprocess"
         elif review_guard_enabled and review.get("reason") == "review_guard_runner_missing":
             codex_reason = "review_candidate_guard_runner_missing"
         elif review_guard_enabled:
@@ -1619,7 +1632,7 @@ def codex_goal_run(args: dict[str, Any]) -> str:
                     "blockers": [] if has_candidate_changes else ["no_candidate_changes"],
                     "dirty_check": dirty,
                     "codex": {
-                        "status": "not_run",
+                        "status": "guarded_review_subprocess" if codex_reason == "review_candidate_guard_subprocess" else "not_run",
                         "reason": codex_reason,
                     },
                 },
@@ -1834,6 +1847,7 @@ _SCHEMA = {
             "review_runner_enabled": {"type": "boolean"},
             "allow_real_review": {"type": "boolean"},
             "review_guard_enabled": {"type": "boolean"},
+            "review_guard_subprocess_enabled": {"type": "boolean"},
             "review_replay": {"type": "object"},
         },
         "required": ["workdir", "stage_id", "objective", "mode", "dirty_baseline_policy"],

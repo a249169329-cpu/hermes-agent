@@ -109,6 +109,7 @@ def test_schema_exposes_review_candidate_replay_gating_fields():
     assert props["review_runner_enabled"]["type"] == "boolean"
     assert props["allow_real_review"]["type"] == "boolean"
     assert props["review_guard_enabled"]["type"] == "boolean"
+    assert props["review_guard_subprocess_enabled"]["type"] == "boolean"
     assert props["review_replay"]["type"] == "object"
 
 
@@ -995,6 +996,127 @@ def test_review_guard_subprocess_unusable_flood_is_review_unavailable(tmp_path):
     assert result["status"] == "review_unavailable"
     assert result["reason"] == "aggregated_output_flood"
     assert "aggregated_output_flood" in result["blockers"]
+
+
+def test_review_candidate_guard_subprocess_default_false_does_not_call_subprocess(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+    real_run = subprocess.run
+    subprocess_calls = []
+
+    def fake_run(argv, **kwargs):
+        if argv and argv[0] == "git":
+            return real_run(argv, **kwargs)
+        subprocess_calls.append(argv)
+        raise AssertionError("subprocess guard must stay disabled by default")
+
+    monkeypatch.setattr(tool.subprocess, "run", fake_run)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7f",
+        review_runner_enabled=True,
+        allow_real_review=True,
+        review_guard_enabled=True,
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["review"]["reason"] == "review_guard_runner_missing"
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "review_candidate_guard_runner_missing"}
+    assert subprocess_calls == []
+
+
+def test_review_candidate_guard_subprocess_not_authorized_does_not_call_subprocess(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+    real_run = subprocess.run
+    subprocess_calls = []
+
+    def fake_run(argv, **kwargs):
+        if argv and argv[0] == "git":
+            return real_run(argv, **kwargs)
+        subprocess_calls.append(argv)
+        raise AssertionError("subprocess guard must require allow_real_review")
+
+    monkeypatch.setattr(tool.subprocess, "run", fake_run)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7f",
+        review_runner_enabled=True,
+        allow_real_review=False,
+        review_guard_enabled=True,
+        review_guard_subprocess_enabled=True,
+    )
+
+    assert result["status"] == "real_review_not_authorized"
+    assert result["review"]["status"] == "real_review_not_authorized"
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "review_candidate_not_authorized"}
+    assert subprocess_calls == []
+
+
+def test_review_candidate_guard_subprocess_explicit_opt_in_calls_packet_guard(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "README.md").write_text("hello\ntracked change\n", encoding="utf-8")
+    (repo / "notes.md").write_text("untracked candidate note\n", encoding="utf-8")
+    real_run = subprocess.run
+    guard_calls = []
+
+    def fake_run(argv, **kwargs):
+        if argv and argv[0] == "git":
+            return real_run(argv, **kwargs)
+        guard_calls.append({"argv": argv, "kwargs": kwargs})
+        packet_file = Path(argv[argv.index("--review-packet-file") + 1])
+        packet = json.loads(packet_file.read_text(encoding="utf-8"))
+        assert packet["stage_id"] == "slice-7f"
+        assert packet["candidate_evidence"]["changed_files"] == ["README.md"]
+        assert packet["candidate_evidence"]["untracked_files"] == ["notes.md"]
+        assert "raw_log" not in json.dumps(packet, ensure_ascii=False)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "status": "passed",
+                "review": {
+                    "verdict": "passed",
+                    "summary": "explicit subprocess opt-in ok",
+                    "must_fix": [],
+                    "suggested_fixes": [],
+                    "verification_commands": [],
+                    "final_judgment": "可以继续",
+                },
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr(tool.subprocess, "run", fake_run)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7f",
+        objective="Run explicit subprocess packet guard",
+        review_runner_enabled=True,
+        allow_real_review=True,
+        review_guard_enabled=True,
+        review_guard_subprocess_enabled=True,
+    )
+
+    assert result["status"] == "review_passed"
+    assert result["classification"] == "reviewed"
+    assert result["candidate_disposition"] == "needs_verification"
+    assert result["preflight"]["codex"] == {"status": "guarded_review_subprocess", "reason": "review_candidate_guard_subprocess"}
+    assert result["completion_trusted"] is False
+    assert len(guard_calls) == 1
+    argv = guard_calls[0]["argv"]
+    assert "--review-packet-file" in argv
+    assert "--prompt-file" in argv
+    assert "--raw-log" in argv
+    assert "--final-file" in argv
+    assert guard_calls[0]["kwargs"]["shell"] is False
+    assert "--enable goals" not in " ".join(map(str, argv))
+    assert result["review"]["guard"]["runner"]["status"] == "completed"
 
 
 def test_codex_goals_preflight_uses_features_list(monkeypatch):
