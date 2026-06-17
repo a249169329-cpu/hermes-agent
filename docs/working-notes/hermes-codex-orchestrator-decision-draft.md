@@ -490,9 +490,156 @@ awaiting_authorization | stopped
 
 Phase 1C 仍不应做：真实 TUI、真实 review subprocess、push / deploy / restart、secret / real data / real provider。
 
-## 16. 本文验收标准
+## 16. Phase 1C recovery ledger 最小 schema（docs-only）
 
-本文作为 docs-only Phase 1A，完成标准是：
+> 状态：Phase 1C docs-only recovery ledger 草案；不是 runtime 实现，也不是当前运行态已经记录这些字段。
+> 目的：让 context compaction、session resume、QQ “继续/按你建议来”之后，Hermes 能先恢复当前阶段和证据边界，而不是复活旧任务或误把摘要当成事实。
+
+### 16.1 大白话目标
+
+`orchestrator recovery ledger` 是一张“交接卡”。
+
+它不替代 git、测试、review、工具输出；它只告诉下一轮 Hermes：
+
+```text
+现在做的是哪一阶段；
+上一次真正验证到哪里；
+哪些只是摘要线索；
+哪些动作没授权；
+下一步只能做什么；
+哪些事明确不能顺手做。
+```
+
+核心原则：
+
+```text
+ledger helps recovery, but fresh evidence still wins.
+```
+
+### 16.2 最小 schema
+
+```yaml
+orchestrator_recovery_ledger:
+  schema_version: orchestrator_recovery_ledger.v1
+  phase:
+    name: Orchestrator Phase 1C
+    stage_id: phase-1c-recovery-ledger
+    status: planned | in_progress | verified_local | awaiting_authorization | stopped | blocked
+    source_of_truth_doc: docs/working-notes/hermes-codex-orchestrator-decision-draft.md
+  current_user_intent:
+    latest_user_message:
+    interpreted_action:
+    confidence: high | medium | low
+  driver:
+    selected: hermes_direct | guarded_lane | official_goal_lane | human_gate | none
+    reason:
+    not_selected:
+      guarded_lane:
+      official_goal_lane:
+      human_gate:
+  worktree:
+    path:
+    branch:
+    head:
+    upstream:
+    ahead_behind:
+    dirty_state: clean | expected_dirty | unknown_dirty | not_checked
+    expected_dirty_paths:
+    dirty_owner: current_phase | previous_phase | other_session | unknown | none
+  authorization:
+    mode: none | one_turn | phase | session
+    scope:
+    side_effects_allowed:
+    expires_when:
+    must_reconfirm_before:
+  evidence_boundary:
+    current_turn_verified:
+    same_session_verified:
+    subagent_claims_unverified:
+    context_summary_hints:
+    unknown_or_not_proven:
+  checks:
+    commands_run:
+    files_read:
+    files_changed:
+    review_status: not_run | passed | blocked | unavailable
+    verification_status: not_run | passed | failed | partial
+    residue_status:
+  next_action:
+    recommended:
+    allowed_without_new_auth:
+    requires_user_auth:
+    stop_conditions:
+  explicit_out_of_scope:
+    - real TUI
+    - real review subprocess
+    - push / PR
+    - deploy / restart
+    - secret / real data / real provider
+    - memory / skill cleanup
+    - CodeGraph repair
+    - browser repair
+    - memory / Swap operations
+  recovery_notes:
+    compaction_happened:
+    tool_schema_stale:
+    codegraph_available:
+    session_search_mode_current_available:
+```
+
+### 16.3 证据分层规则
+
+恢复时必须把证据分层，不允许混说：
+
+| 层级 | 能不能直接信 | 用法 |
+|---|---:|---|
+| fresh tool output | 高 | 当前轮刚跑的 `git status` / diff / test / remote SHA 等，可以作为报告证据 |
+| same-session verified evidence | 中高 | 同一会话刚验证过，但关键结论最好用轻量 fresh check 补强 |
+| subagent review | 中 | 可作为 reviewer input；主代理必须复核关键 git/status/diff 后才能说通过 |
+| context summary | 中低 | 只作恢复线索，不可单独证明已完成、已 push、已部署、已重启 |
+| memory/profile | 低到中 | 只提供长期偏好/环境事实，不证明当前状态 |
+| old search result / broad FTS | 低 | 可能串旧会话；当前阶段恢复应优先 `mode="current"` 或明确 doc/git evidence |
+
+### 16.4 恢复流程
+
+在 context compaction、API 中断、或用户说“继续/按你建议来”之后，先走这个顺序：
+
+```text
+1. 读取 latest user message。
+2. 读取 active todo / preserved task list。
+3. 读取 ledger 的 phase/status/next_action。
+4. 跑轻量 fresh check：git status、HEAD、upstream、expected dirty paths。
+5. 如果用户问“前面说的/本会话开头”，用 current-scope/current-mode recall；不要 broad FTS。
+6. 若 ledger、git、用户最新消息冲突，以用户最新消息 + fresh evidence 为准。
+7. 若仍不确定，停下问用户；不要自动切到内存/CodeGraph/browser/cleanup 等邻近任务。
+```
+
+### 16.5 QQ 汇报模板
+
+| 状态 | QQ 短句 |
+|---|---|
+| 恢复中 | 我先恢复阶段边界：只查 ledger + git 状态，不写文件。 |
+| 证据不足 | 当前只有摘要线索，不足以证明完成；我先做 fresh status check。 |
+| 串旧会话风险 | 这个问题容易被 broad search 串旧会话；我用当前会话范围查。 |
+| 可继续 | 阶段、worktree、next action 对上了；继续当前小阶段。 |
+| 需确认 | ledger 和当前状态冲突；停下等你确认，不自动扩范围。 |
+
+### 16.6 Phase 1C 验收标准
+
+Phase 1C docs-only 完成标准：
+
+- ledger schema 覆盖 phase、driver、worktree、authorization、evidence boundary、checks、next action、out-of-scope；
+- 明确 fresh evidence 优先于 summary/memory；
+- 明确 subagent 结论必须主代理复核；
+- 明确 compaction 后不得复活旧任务；
+- 明确 `session_search(mode="current")` / current-scope recall 用途；
+- 明确不做真实 TUI、真实 review subprocess、push / deploy / restart、secret / real data / real provider、CodeGraph/browser/memory/Swap 修复；
+- `git diff --check` 通过；
+- worktree 状态只显示预期 docs 改动。
+
+## 17. 本文验收标准
+
+本文作为 Phase 1 docs-only decision record，完成标准是：
 
 - 只改本文件或最多同一 working-note 范围；
 - 明确“设计记录，不是 runtime 已实现”；
