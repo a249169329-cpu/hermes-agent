@@ -1,6 +1,6 @@
 # `codex_goal_run` Runtime Driver Design
 
-> 状态：设计文档 / implementation plan；Slice 1-4C mock-first/replay runtime skeleton 已实现，真实 TUI 尚未接入。
+> 状态：设计文档 / implementation plan；Slice 1-4D mock-first/replay/gated runtime skeleton 已实现，真实 TUI 尚未接入。
 > 日期：2026-06-16
 > 关联文档：
 > - `docs/working-notes/hermes-codex-division-of-labor.md`
@@ -20,6 +20,7 @@
 | Slice 3 | `65dccf854 feat(codex): add mock goal monitor lifecycle` | `monitor_goal` wait-window / idle composer 状态机、dirty candidate evidence、completed/failed/running/idle 分类 | 否 |
 | Slice 4A/4B | `3990f8e68 feat(codex): add goal snapshot classifier` | `_bounded_log_tail` + `_classify_goal_snapshot` replay classifier；process/log/git evidence → monitor states | 否 |
 | Slice 4C | `a43dc5684 feat(codex): add disabled goal adapter wrappers` | `_collect_goal_process_snapshot` / `_collect_goal_git_evidence` / `_compose_goal_snapshot` disabled/replay wrappers | 否 |
+| Slice 4D | `f55af62e5 feat(codex): add gated goal adapter runner` | `_goal_adapter_stop_condition` / `_run_goal_adapter_once` gated runner interface，默认 disabled | 否 |
 
 详细对照表与 Slice 4 边界计划见：
 
@@ -647,7 +648,7 @@ git diff --check HEAD
 - process exited with diff；
 - untracked files included。
 
-### Slice 4：real adapter contract / replay classifier，不接真实 TUI（4A/4B/4C 已实现）
+### Slice 4：real adapter contract / replay classifier，不接真实 TUI（4A/4B/4C/4D 已实现）
 
 功能：
 
@@ -655,6 +656,7 @@ git diff --check HEAD
 - 用 replay/mock transcript tests 覆盖 process/log/git evidence → monitor state 映射；（已完成）
 - 新增纯函数 classifier，例如 process running/output、idle no diff、process exited with diff、pasted content suspected、process missing；（已完成）
 - 新增默认 disabled/replay-only adapter wrappers：`_collect_goal_process_snapshot` / `_collect_goal_git_evidence` / `_compose_goal_snapshot`；（已完成）
+- 新增 gated runner interface 和 stop condition：`_run_goal_adapter_once` / `_goal_adapter_stop_condition`；（已完成）
 - 默认仍 disabled/mock-only，不调用真实 terminal/process，不启动 `codex-yuna --enable goals`。
 
 测试：
@@ -668,7 +670,11 @@ git diff --check HEAD
 - historical paste warning 不覆盖后续 `Goal achieved` + diff；
 - nonzero exit 始终 failed，不能被 `Goal achieved` 覆盖；
 - default disabled adapters 不读真实 process/git，missing repo 安全；
-- replay process/log/git evidence 被规范化并可喂给 classifier。
+- replay process/log/git evidence 被规范化并可喂给 classifier；
+- default runner disabled 不调用 runner；
+- unauthorized runner 不调用 runner；
+- authorized path 当前只调用 injected fake runner；
+- failed / needs_attention / process_missing stop reason 不被泛化成 blocked。
 
 ### Slice 5：review handoff integration
 
@@ -727,21 +733,21 @@ git diff --check HEAD
 
 ## 19. 下一步建议
 
-若继续进入实现，建议先做 **Slice 4D：real adapter runner 接口和 stop condition**。
+若继续进入实现，建议先做 **Slice 4E：真实 adapter 调用点接入方式，仍默认 disabled**。
 
 理由：
 
 ```text
-Slice 1-4C 已完成 mock/replay/disabled-wrapper skeleton。
-下一步应设计真实 adapter runner 的调用接口、gated flag、stop condition，但默认仍 disabled。
-等 gated adapter 接口稳定后，再考虑真实 TUI smoke。
+Slice 1-4D 已完成 mock/replay/disabled-wrapper/gated-runner skeleton。
+下一步应设计真实 adapter 调用点如何挂到 gated runner，但仍默认 disabled。
+等真实 adapter 调用点的边界和 stop condition 稳定后，再考虑真实 TUI smoke。
 ```
 
 下一阶段应停止在：
 
 ```text
-real adapter runner interface
-gated flag / stop condition
+real adapter call-site contract
+adapter_enabled / allow_real_adapter gating kept fail-closed
 no real terminal/process call by default
 ```
 

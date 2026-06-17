@@ -1,6 +1,6 @@
 # `codex_goal_run` Slice Handoff
 
-> 状态：Slice 1-4C mock/replay driver 已实现并本地提交；真实 Codex TUI 尚未接入。
+> 状态：Slice 1-4D mock/replay/gated driver 已实现并本地提交；真实 Codex TUI 尚未接入。
 > 日期：2026-06-16
 > 关联设计：`docs/working-notes/hermes-codex-goal-run-design.md`
 > 关联实现：`tools/codex_goal_run_tool.py`、`tests/tools/test_codex_goal_run_tool.py`
@@ -8,8 +8,8 @@
 ## 1. 当前边界结论
 
 ```text
-Slice 1-4C = official Codex /goal driver 的 mock-first + replay classifier + disabled adapter wrapper 骨架。
-它证明 API、artifact、launch lifecycle、monitor state machine、process/log/git snapshot classifier 和 disabled adapter wrapper 可以被 Hermes 编排。
+Slice 1-4D = official Codex /goal driver 的 mock-first + replay classifier + disabled/gated adapter runner 骨架。
+它证明 API、artifact、launch lifecycle、monitor state machine、process/log/git snapshot classifier、disabled adapter wrapper 和 gated runner interface 可以被 Hermes 编排。
 它没有启动真实 Codex TUI，也没有执行真实 `codex-yuna --enable goals`。
 ```
 
@@ -23,6 +23,7 @@ Slice 1-4C = official Codex /goal driver 的 mock-first + replay classifier + di
 - `monitor_goal` 允许 dirty candidate worktree，但 dirty 只作为 evidence，不作为 final success。
 - `_classify_goal_snapshot` 是纯函数，只吃 replay/mock snapshot。
 - `_collect_goal_process_snapshot` / `_collect_goal_git_evidence` / `_compose_goal_snapshot` 默认 disabled/replay-only。
+- `_run_goal_adapter_once` 默认 disabled，只有显式 `adapter_enabled=True` 且 `allow_real_adapter=True` 才调用注入 runner；当前测试只用 fake injected runner。
 - 不 push / deploy / restart / merge。
 - 不读 secret，不跑真实 provider / 真实数据 / 真实媒体。
 
@@ -35,6 +36,7 @@ Slice 1-4C = official Codex /goal driver 的 mock-first + replay classifier + di
 | Slice 3 | `monitor_goal` mock state machine | 按 wait-window 调用 `_poll_goal_session`；分类 `idle_wait` / `running` / `completed` / `failed` / `missing_session_id` | idle composer message；持续有输出返回 `running`；completed/failed 都不 trusted；missing session 先 blocked；dirty candidate worktree 可作为 evidence 继续 monitor | 不读取真实 process/log；不收集真实 git diff evidence；不关闭 TUI；不做 candidate review handoff |
 | Slice 4A/4B | replay snapshot classifier | `_bounded_log_tail` 限制 raw log；`_classify_goal_snapshot` 纯函数把 process/log/git evidence 映射成状态 | process missing 保留 candidate evidence；running output 不误报 idle；`[Pasted Content]` + no diff 走 attention；`Goal achieved` + diff 走 collect；nonzero exit 始终 failed；untracked-only evidence 不丢 | 不调用 terminal/process/subprocess；不启动真实 TUI；不执行真实 `codex-yuna --enable goals`；不做完整 adapter wrapper |
 | Slice 4C | disabled adapter wrapper contract | `_collect_goal_process_snapshot` / `_collect_goal_git_evidence` / `_compose_goal_snapshot` 默认 disabled，可吃 replay fixture | missing repo 也安全；default adapters 不读真实进程/git；process replay 和 git replay 被规范化；composed replay snapshot 可直接喂 classifier | 不接真实 terminal/process/git adapter；不启动真实 TUI；不执行真实 `codex-yuna --enable goals` |
+| Slice 4D | gated adapter runner contract | `_goal_adapter_stop_condition` / `_run_goal_adapter_once` 定义 runner gate 和 stop reason | default disabled 不调用 runner；未授权不调用 runner；授权路径只调用注入 runner；candidate ready 停止；failed/attention/process_missing 保留具体 stop reason | 不接真实 terminal/process/git runner；不启动真实 TUI；不执行真实 `codex-yuna --enable goals` |
 
 ## 3. Mode 当前状态对照
 
@@ -46,6 +48,7 @@ Slice 1-4C = official Codex /goal driver 的 mock-first + replay classifier + di
 | `monitor_goal` | `session_id`、`monitor_interval_seconds`、`max_wait_windows` | 否，dirty 作为 evidence | `monitor.state` + wait-window summary | `running` 或 `needs_review` | 默认 poll hook 不读真实 process/log/git diff |
 | pure classifier | replay/mock `snapshot` | 不适用 | `result_status` + `monitor` + `candidate_evidence` | always untrusted | 只被测试/后续 adapter 调用；当前不接真实工具 |
 | disabled adapters | replay/default params | 不适用 | composed process/log/git snapshot | untrusted evidence only | 默认 disabled；只支持 replay/default，不读真实系统 |
+| gated runner | `adapter_enabled` / `allow_real_adapter` / injected runners | 不适用 | status + snapshot + classification + stop_condition | always untrusted | 默认 disabled；未授权 blocked；当前无真实 runner |
 
 ## 4. 当前提交证据
 
@@ -55,13 +58,14 @@ Slice 1-4C = official Codex /goal driver 的 mock-first + replay classifier + di
 65dccf854 feat(codex): add mock goal monitor lifecycle
 3990f8e68 feat(codex): add goal snapshot classifier
 a43dc5684 feat(codex): add disabled goal adapter wrappers
+f55af62e5 feat(codex): add gated goal adapter runner
 ```
 
 测试证据来自最近实现收口：
 
 ```text
 python3 -m pytest tests/tools/test_codex_goal_run_tool.py -q -o addopts=''
-36 passed
+41 passed
 
 python3 -m py_compile tools/codex_goal_run_tool.py tests/tools/test_codex_goal_run_tool.py
 py_compile_exit_0
@@ -83,13 +87,15 @@ _classify_goal_snapshot True
 _collect_goal_process_snapshot True
 _collect_goal_git_evidence True
 _compose_goal_snapshot True
+_goal_adapter_stop_condition True
+_run_goal_adapter_once True
 ```
 
 说明：`enable_goals_command_count 1` 是 command 字符串，不是本轮真实执行。
 
-## 5. Slice 4 当前状态：real adapter contract / replay classifier / disabled wrapper，未接真实 TUI
+## 5. Slice 4 当前状态：real adapter contract / replay classifier / disabled wrapper / gated runner，未接真实 TUI
 
-Slice 4A/4B/4C 已完成：把真实 adapter 的输入/输出契约设计清楚，用 replay/mock snapshot tests 锁住分类行为，并提供默认 disabled 的 adapter wrapper contract。
+Slice 4A/4B/4C/4D 已完成：把真实 adapter 的输入/输出契约设计清楚，用 replay/mock snapshot tests 锁住分类行为，提供默认 disabled 的 adapter wrapper contract，并定义 gated runner interface / stop condition。
 
 ### 5.1 Slice 4 目标
 
@@ -108,6 +114,8 @@ Slice 4A/4B/4C 已完成：把真实 adapter 的输入/输出契约设计清楚�
 | `_collect_goal_process_snapshot(session_id)` | 描述真实 process 状态的 adapter contract | 否，已实现 disabled/replay wrapper |
 | `_collect_goal_git_evidence(repo)` | 描述 git status/diff/untracked/staged evidence 的 contract | 否，已实现 disabled/replay wrapper |
 | `_compose_goal_snapshot(...)` | 组合 process/log/git snapshot 并喂给 classifier | 否，已实现 disabled/replay wrapper |
+| `_goal_adapter_stop_condition(classification)` | 将 classifier result 转为 runner stop condition | 否，已实现纯函数 |
+| `_run_goal_adapter_once(...)` | gated runner interface；默认 disabled；授权时只调用注入 runner | 否，已实现 gated/injected-only wrapper |
 
 ### 5.3 Slice 4 状态映射
 
@@ -139,6 +147,10 @@ Slice 4A/4B/4C 已完成：把真实 adapter 的输入/输出契约设计清楚�
 | default disabled adapters | missing repo + no replay | safe disabled snapshot，不读 repo/process |
 | process replay adapter | process/log replay fixture | normalized process/log snapshot |
 | git replay adapter | git replay fixture | changed/staged/untracked/diff_stat 不丢 |
+| default gated runner | adapter disabled + injected forbidden runners | 不调用 runner，返回 `adapter_disabled` |
+| unauthorized gated runner | `adapter_enabled=True` but `allow_real_adapter=False` | 不调用 runner，返回 `real_adapter_not_authorized` |
+| authorized injected runner | fake process/git runners | 只调用 injected runner，结果喂 classifier + stop condition |
+| stop condition reason | failed/attention/process_missing | 保留具体 reason，不泛化成 blocked |
 
 ### 5.5 Slice 4 明确非目标
 
@@ -177,8 +189,8 @@ Slice 5 之前必须先有：
 推荐下一步仍然不进真实 TUI：
 
 ```text
-Slice 4D：设计真实 adapter runner 接口和 stop condition，但默认仍 disabled。
-Slice 4E：把真实 adapter 调用点接入 gated flag，不接真实 terminal/process。
+Slice 4E：设计真实 adapter 调用点接入方式，但仍保持默认 disabled。
+Slice 4F：准备最小真实 TUI smoke runbook，不执行。
 Slice 5：只有用户单独授权后，才做真实 TUI smoke。
 ```
 
