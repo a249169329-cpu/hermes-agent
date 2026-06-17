@@ -359,16 +359,136 @@ awaiting_authorization | stopped
 4. 不 push / deploy / restart；
 5. 下一轮再决定是否进入实现前设计：state machine / evidence schema / authorization matrix 的 runtime mapping。
 
-## 15. Phase 1B 进入实现前必须补齐
+## 15. Phase 1B runtime mapping（只读补充）
 
-实现前需要先有明确答案：
+> 状态：Phase 1B 只读 mapping；本节不是 runtime 实现，不代表工具已经统一编排。
+> 本节只把 Phase 1A 的设计问题映射到现有 runtime surface，方便后续实现前拆 slice。
 
-- dirty worktree gate 放在哪一层：tool guard、workflow orchestrator，还是两边都有？
-- authorization record 的生命周期：一次性、阶段性、会话性，何时失效？
-- `tool_schema_stale` 怎么检测和汇报？
-- context compaction 后如何恢复当前 phase，而不是复活旧任务？
-- official `/goal` lane 的 evidence schema 与 ordinary guarded lane 如何最小统一？
-- review subprocess 真实路径是否仍保持单独四重 gate？默认答案：是。
+### 15.1 已观察到的 runtime surface
+
+| surface | 现有职责 | 对 orchestrator 的含义 |
+|---|---|---|
+| `tools/codex_workflow_run_tool.py` | 高层 dirty recovery + guarded lane 调度；可在授权下清 cache-only residue 或创建 isolated worktree；再委派 `codex_staged_implement` | 最接近 ordinary guarded lane 的 workflow orchestrator；适合作为后续 driver-selection 的上层入口之一 |
+| `tools/codex_staged_implement_tool.py` | 窄范围候选实现；要求显式 `allowed_files` / `allowed_globs`；`dirty_baseline_policy=require-clean`；`completion_trusted` 只说明 runner 没触发已知异常 | 适合小 slice / review blocker；不拥有最终完成权；必须进入 Hermes diff review + verification |
+| `tools/codex_goal_run_tool.py` | official `/goal` 的 prepare/launch/monitor/collect/review skeleton；默认 mock/disabled；`collect_candidate` / `review_candidate` 生成 candidate evidence 和 review handoff | 适合 official TUI `/goal` lane；Goal 输出仍只是 candidate；review subprocess 仍默认关闭 |
+| `scripts/runtime/codex_impl_guard.py` | implementation guard；dirty baseline、allowlist、candidate path、输出限制等底层保护 | 这是底层 fail-closed guard，不应承担高层 orchestration/授权生命周期 |
+| `scripts/runtime/codex_review_guard.py` + `codex_review_packet.py` | bounded packet-only review；避免全量日志/源码 flood；原始 runner 可返回 passed/failed/unusable，经 adapter 映射为 passed/blocked/unavailable 语义 | 适合统一 review packet 形状；`review_unavailable` 不能算 pass |
+| `session_search` current-scope/current-mode 方向 | 用于“本会话/这个会话开头”类恢复，避免 broad FTS 串旧会话 | 属于 context recovery 支撑层；orchestrator ledger 不能只靠 FTS 召回 |
+
+### 15.2 六个实现前问题的当前答案
+
+1. **dirty worktree gate 放哪层？**
+
+   答案：两边都有，但职责不同。
+
+   - 底层 guard：继续 fail-closed，例如 `codex_staged_implement` / `codex_impl_guard.py` 的 `require-clean` 和 allowlist 检查。
+   - 高层 workflow：由 `codex_workflow_run` / 未来 orchestrator 先归因、清理 safe cache、或创建 isolated worktree。
+   - official `/goal`：启动前仍偏向 isolated clean worktree；`collect_candidate` / `review_candidate` 阶段可以读取 dirty candidate evidence，但不能把 dirty 本身当成功。
+
+   结论：dirty recovery 不应塞进 `codex_goal_run` 底层；应由上层 orchestrator 先处理 driver 选择和 worktree 策略。
+
+2. **authorization record 生命周期怎么定义？**
+
+   建议首版只支持三档：
+
+   ```text
+   one_turn: 只对当前一次工具/阶段动作有效
+   phase: 只对当前 stage_id / phase 有效
+   session: 只在当前会话上下文可信时有效
+   ```
+
+   遇到这些情况应自动失效或降级为重新确认：
+
+   - context compaction 后 evidence 不完整；
+   - worktree dirty ownership 不明；
+   - `tool_schema_stale`；
+   - scope 扩大；
+   - review/verification 失败；
+   - push / PR / deploy / restart / secret / real data / real provider / destructive cleanup。
+
+   `standing_authorization` 只能覆盖本地、非破坏性、已列明的动作；不能覆盖真实副作用。
+
+3. **`tool_schema_stale` 怎么检测和汇报？**
+
+   需要一个 preflight probe：
+
+   ```text
+   expected runtime source/schema fields
+   ↔ active tool schema visible to current session
+   ```
+
+   如果源码已经有某字段，但当前会话 tool schema 没暴露，应返回：
+
+   ```text
+   status: preflight_blocked
+   reason: tool_schema_stale
+   next_action: refresh/restart/new-session authorization
+   ```
+
+   QQ 汇报口径：
+
+   ```text
+   本地源码有这个字段，但当前会话工具 schema 可能还没刷新；不宣称已上线。
+   ```
+
+4. **context compaction 后如何恢复当前 phase？**
+
+   不能靠 broad keyword search 自动猜。
+
+   最小恢复顺序：
+
+   ```text
+   preserved todo / current phase marker
+   → git status + touched files
+   → orchestrator ledger last state
+   → session_search(mode="current") 或等价 current-scope recall
+   → 仍不确定则停下问用户
+   ```
+
+   ledger 必须记录：当前 phase、driver、worktree、dirty state、last verified evidence、authorization mode、next action、明确 out-of-scope。
+
+5. **official `/goal` lane 与 ordinary guarded lane 的 evidence 如何统一？**
+
+   不要求底层工具输出完全一样；先用 adapter mapping 统一到最小 envelope：
+
+   ```text
+   driver:
+   reason:
+   worktree:
+   authorization:
+   candidate:
+   review:
+   verification:
+   final_disposition:
+   ```
+
+   guarded lane 的 `completion_trusted` 只能映射成“runner 没触发已知异常”；Goal lane 的 `Goal achieved` 只能映射成“candidate_ready”。两者都不能直接映射成 done。
+
+6. **review subprocess 是否保持四重 gate？**
+
+   答案：是。
+
+   真实 review subprocess 仍必须同时满足：
+
+   ```text
+   review_runner_enabled=True
+   allow_real_review=True
+   review_guard_enabled=True
+   review_guard_subprocess_enabled=True
+   ```
+
+   并且只允许 packet-only review。`review_unavailable` / `aggregated_output_flood` / `packet_truncated` / non-json 都必须保留为 blocked/unavailable，不得冒充通过。
+
+### 15.3 Phase 1C 建议切分
+
+如果继续推进，下一步仍建议 docs-first，而不是直接 runtime 实现：
+
+1. 写 `orchestrator recovery ledger` 最小 schema；
+2. 写 driver-selection preflight pseudo-code；
+3. 明确 `tool_schema_stale` probe 的输入/输出；
+4. 再决定是否进入 runtime slice。
+
+Phase 1C 仍不应做：真实 TUI、真实 review subprocess、push / deploy / restart、secret / real data / real provider。
 
 ## 16. 本文验收标准
 
