@@ -1,6 +1,6 @@
 # `codex_goal_run` Runtime Driver Design
 
-> 状态：设计文档 / implementation plan；Slice 1-7C mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、smoke hardening、`collect_candidate` review handoff、`review_candidate` replay review lane、以及真实 review runner adapter call-site 已实现；真实 review runner 仍未注入 runtime 默认路径。
+> 状态：设计文档 / implementation plan；Slice 1-7D mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、smoke hardening、`collect_candidate` review handoff、`review_candidate` replay review lane、真实 review runner adapter call-site、以及 bounded packet review guard adapter 已实现；真实 guard subprocess runner 仍未注入 runtime 默认路径。
 > 日期：2026-06-17
 > 关联文档：
 > - `docs/working-notes/hermes-codex-division-of-labor.md`
@@ -29,6 +29,7 @@
 | Slice 7A | `collect_candidate` review handoff | dirty candidate worktree 可收集 tracked/staged/untracked/diff_stat/status evidence；生成 bounded `review_handoff.review_packet` | 否 |
 | Slice 7B | `review_candidate` replay review lane | 复用 candidate packet；接收 `review_replay`；分类 passed / blocked / unavailable；默认 review runner disabled | 否 |
 | Slice 7C | real review runner adapter call-site | `allow_real_review=True` 且 runner 已注入时才调用；runner 缺失 fail-closed；fake runner 只收 `review_packet` | 否 |
+| Slice 7D | bounded packet review guard adapter | `review_guard_enabled=True` 时构造 packet-only prompt；fake guard runner 返回 passed/blocked/unavailable 会映射到 review_candidate 状态 | 否 |
 
 详细对照表与 Slice 4 边界计划见：
 
@@ -762,20 +763,40 @@ git diff --check HEAD
 - runner exception 映射为 `review_unavailable`；
 - long objective / many untracked files 在进入 runner 前已 bounded。
 
-### Slice 7D（后续）：bounded packet/review guard adapter implementation
+### Slice 7D：bounded packet/review guard adapter（已实现）
 
 功能：
 
-- 在 Slice 7C hook 后面实现真实 adapter；
-- 真实 adapter 默认 disabled，需要显式授权；
-- adapter 应调用 bounded packet / review guard，而不是 raw unbounded Codex review；
+- 在 Slice 7C hook 后面实现 packet-only guard adapter；
+- adapter 默认 disabled，需要 `review_guard_enabled=True`、`review_runner_enabled=True`、`allow_real_review=True`；
+- guard runner 仍需注入；默认不执行真实 subprocess / Codex review；
+- adapter 构造 packet-only prompt，不允许 shell / direct file inspection / full source / full diff；
+- raw log fields (`raw_tui_log` / `raw_log`) 会在进入 prompt / guard runner 前递归剥离；
+- `aggregated_output_flood` / `review_unusable` / `unavailable` / `unusable` 不算 pass；
 - review unavailable 不算 pass。
 
 测试：
 
 - adapter disabled 不调用 guard；
 - fake guard 接收 packet-only prompt；
-- `aggregated_output_flood` / unusable guard output 映射为 `review_unavailable`。
+- `aggregated_output_flood` / unusable guard output 映射为 `review_unavailable`；
+- `status=unavailable` / `review_unusable=True` 映射为 `review_unavailable`；
+- top-level / nested `raw_tui_log` / `raw_log` 不进入 prompt 或 guard packet。
+
+### Slice 7E（后续）：subprocess-backed review guard runner wrapper
+
+功能：
+
+- 在 Slice 7D adapter 后面实现真实 subprocess-backed guard runner；
+- 默认仍不注入 runtime path；
+- 只通过 `codex_review_guard.py --review-packet-file` / packet-only prompt 执行；
+- raw log / final file 只作为 bounded metadata，不进入普通 result 大字段。
+
+测试：
+
+- fake subprocess runner 命令参数包含 `--review-packet-file`；
+- missing guard script / nonzero / unusable / flood 均 fail-closed；
+- 不调用 raw TUI / `codex-yuna --enable goals`。
 
 ## 16. 不建议首版做的事
 
@@ -820,21 +841,21 @@ git diff --check HEAD
 
 ## 19. 下一步建议
 
-若继续进入实现，下一步建议是 **Slice 7D：bounded packet/review guard adapter implementation**，默认不再跑真实 TUI。
+若继续进入实现，下一步建议是 **Slice 7E：subprocess-backed review guard runner wrapper**，默认不再跑真实 TUI。
 
 理由：
 
 ```text
-Slice 1-7C 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke、smoke hardening、collect_candidate review handoff、review_candidate replay lane 和 real review runner adapter call-site。
-下一步才考虑在 call-site 后面实现 bounded packet/review guard adapter。
+Slice 1-7D 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke、smoke hardening、collect_candidate review handoff、review_candidate replay lane、real review runner adapter call-site 和 bounded packet review guard adapter。
+下一步才考虑实现真实 subprocess-backed guard runner wrapper。
 默认不再启动真实 TUI；只有用户重新明确授权时才重跑 smoke。
 ```
 
 下一阶段应停止在：
 
 ```text
-bounded packet/review guard adapter implementation
-default disabled/explicit authorization only
+subprocess-backed review guard runner wrapper
+default not injected/explicit authorization only
 do not repeat real TUI smoke
 ```
 

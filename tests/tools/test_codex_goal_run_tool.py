@@ -108,6 +108,7 @@ def test_schema_exposes_review_candidate_replay_gating_fields():
 
     assert props["review_runner_enabled"]["type"] == "boolean"
     assert props["allow_real_review"]["type"] == "boolean"
+    assert props["review_guard_enabled"]["type"] == "boolean"
     assert props["review_replay"]["type"] == "object"
 
 
@@ -523,6 +524,230 @@ def test_review_candidate_runner_receives_bounded_packet(tmp_path, monkeypatch):
     assert untracked[-1] == "...[5 more]"
     assert len(packet["objective"]) <= tool._STRING_LIMIT
     assert packet["objective"].endswith("...[truncated]")
+
+
+def test_review_candidate_guard_disabled_does_not_call_guard_runner(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+    calls = []
+
+    def forbidden_guard(*, prompt, review_packet):
+        calls.append((prompt, review_packet))
+        raise AssertionError("disabled guard adapter must not call review guard")
+
+    monkeypatch.setattr(tool, "_REAL_CANDIDATE_REVIEW_GUARD_RUNNER", forbidden_guard, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7d",
+        review_runner_enabled=True,
+        allow_real_review=True,
+        review_guard_enabled=False,
+    )
+
+    assert result["status"] == "review_runner_missing"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "run_manual_or_guarded_review"
+    assert result["completion_trusted"] is False
+    assert calls == []
+
+
+def test_review_candidate_guard_adapter_passes_packet_only_prompt(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "README.md").write_text("hello\ntracked change\n", encoding="utf-8")
+    (repo / "notes.md").write_text("untracked candidate note\n", encoding="utf-8")
+    calls = []
+
+    def fake_guard(*, prompt, review_packet):
+        calls.append({"prompt": prompt, "review_packet": review_packet})
+        return {
+            "status": "passed",
+            "review": {
+                "verdict": "passed",
+                "summary": "packet only ok",
+                "must_fix": [],
+                "suggested_fixes": [],
+                "verification_commands": [],
+                "final_judgment": "可以继续",
+            },
+        }
+
+    monkeypatch.setattr(tool, "_REAL_CANDIDATE_REVIEW_GUARD_RUNNER", fake_guard, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7d",
+        objective="Run bounded packet guard adapter",
+        review_runner_enabled=True,
+        allow_real_review=True,
+        review_guard_enabled=True,
+    )
+
+    assert result["status"] == "review_passed"
+    assert result["classification"] == "reviewed"
+    assert result["candidate_disposition"] == "needs_verification"
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "review_candidate_guard_adapter"}
+    assert result["completion_trusted"] is False
+    assert len(calls) == 1
+    call = calls[0]
+    assert "Review only the bounded packet" in call["prompt"]
+    assert "<bounded_review_packet>" in call["prompt"]
+    assert "raw_tui_log" not in call["prompt"]
+    assert "raw_log" not in call["prompt"]
+    assert call["review_packet"]["stage_id"] == "slice-7d"
+    assert call["review_packet"]["candidate_evidence"]["changed_files"] == ["README.md"]
+    assert call["review_packet"]["candidate_evidence"]["untracked_files"] == ["notes.md"]
+    assert result["review"]["guard"]["status"] == "passed"
+    assert result["review"]["must_fix"] == []
+
+
+def test_review_candidate_guard_adapter_unusable_is_review_unavailable(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    def fake_guard(*, prompt, review_packet):
+        return {
+            "status": "unusable",
+            "reason": "aggregated_output_flood",
+            "review": {
+                "verdict": "unusable",
+                "summary": "guard flooded",
+                "must_fix": [],
+                "suggested_fixes": [],
+                "verification_commands": [],
+                "final_judgment": "需要重试 bounded packet",
+            },
+        }
+
+    monkeypatch.setattr(tool, "_REAL_CANDIDATE_REVIEW_GUARD_RUNNER", fake_guard, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7d",
+        review_runner_enabled=True,
+        allow_real_review=True,
+        review_guard_enabled=True,
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "retry_with_bounded_packet_or_manual_review"
+    assert result["completion_trusted"] is False
+    assert result["review"]["status"] == "review_unavailable"
+    assert "aggregated_output_flood" in result["review"]["blockers"]
+    assert result["review"]["guard"]["status"] == "unusable"
+
+
+def test_review_candidate_guard_adapter_unavailable_status_is_review_unavailable(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    def fake_guard(*, prompt, review_packet):
+        return {
+            "status": "unavailable",
+            "reason": "packet_truncated",
+            "review": {
+                "verdict": "unavailable",
+                "summary": "packet truncated",
+                "must_fix": [],
+                "suggested_fixes": [],
+                "verification_commands": [],
+                "final_judgment": "需要重建 packet",
+            },
+        }
+
+    monkeypatch.setattr(tool, "_REAL_CANDIDATE_REVIEW_GUARD_RUNNER", fake_guard, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7d",
+        review_runner_enabled=True,
+        allow_real_review=True,
+        review_guard_enabled=True,
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["review"]["status"] == "review_unavailable"
+    assert "packet_truncated" in result["review"]["blockers"]
+
+
+def test_review_candidate_guard_adapter_review_unusable_marker_is_review_unavailable(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    def fake_guard(*, prompt, review_packet):
+        return {
+            "status": "passed",
+            "review_unusable": True,
+            "review": {
+                "verdict": "passed",
+                "summary": "claimed pass but unusable",
+                "must_fix": [],
+                "suggested_fixes": [],
+                "verification_commands": [],
+                "final_judgment": "可以继续",
+            },
+        }
+
+    monkeypatch.setattr(tool, "_REAL_CANDIDATE_REVIEW_GUARD_RUNNER", fake_guard, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7d",
+        review_runner_enabled=True,
+        allow_real_review=True,
+        review_guard_enabled=True,
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["review"]["status"] == "review_unavailable"
+    assert "review_unusable" in result["review"]["blockers"]
+
+
+def test_review_guard_adapter_scrubs_raw_log_fields_before_prompt_and_runner():
+    calls = []
+
+    def fake_guard(*, prompt, review_packet):
+        calls.append({"prompt": prompt, "review_packet": review_packet})
+        return {
+            "status": "passed",
+            "review": {
+                "verdict": "passed",
+                "summary": "raw fields absent",
+                "must_fix": [],
+                "suggested_fixes": [],
+                "verification_commands": [],
+                "final_judgment": "可以继续",
+            },
+        }
+
+    result = tool._run_candidate_review_guard_adapter(
+        review_packet={
+            "stage_id": "slice-7d",
+            "raw_tui_log": "SECRET_RAW_TUI",
+            "nested": {"raw_log": "SECRET_RAW_LOG", "safe": "keep"},
+            "items": [{"raw_log": "SECRET_LIST_RAW", "name": "item"}],
+        },
+        guard_runner=fake_guard,
+    )
+
+    assert result["status"] == "passed"
+    assert len(calls) == 1
+    serialized_prompt = calls[0]["prompt"]
+    serialized_packet = json.dumps(calls[0]["review_packet"], ensure_ascii=False)
+    assert "SECRET_RAW_TUI" not in serialized_prompt
+    assert "SECRET_RAW_LOG" not in serialized_prompt
+    assert "SECRET_LIST_RAW" not in serialized_prompt
+    assert "raw_tui_log" not in serialized_packet
+    assert "raw_log" not in serialized_packet
+    assert calls[0]["review_packet"]["nested"]["safe"] == "keep"
 
 
 def test_codex_goals_preflight_uses_features_list(monkeypatch):

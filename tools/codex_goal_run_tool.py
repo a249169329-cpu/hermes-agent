@@ -14,6 +14,7 @@ _DRIVER = "codex_tui_goal"
 _DEFAULT_ARTIFACT_ROOT = Path("/tmp/hermes-codex-goals")
 _TMP_ROOT = Path("/tmp").resolve()
 _REAL_CANDIDATE_REVIEW_RUNNER = None
+_REAL_CANDIDATE_REVIEW_GUARD_RUNNER = None
 _LIST_LIMIT = 80
 _STRING_LIMIT = 4000
 _DIRTY_PATH_LIMIT = 80
@@ -21,6 +22,19 @@ _MANDATORY_NON_GOALS = [
     "do not push, deploy, restart, merge, access secrets, or run real providers/data/media without explicit Hermes/user authorization",
     "do not use codex exec; this is an official Codex TUI /goal handoff",
 ]
+_RAW_REVIEW_PACKET_KEYS = {"raw_tui_log", "raw_log"}
+
+
+def _scrub_raw_review_packet_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _scrub_raw_review_packet_fields(item)
+            for key, item in value.items()
+            if str(key) not in _RAW_REVIEW_PACKET_KEYS
+        }
+    if isinstance(value, list):
+        return [_scrub_raw_review_packet_fields(item) for item in value]
+    return value
 
 
 def _bound(value: Any) -> Any:
@@ -182,6 +196,9 @@ def _normalize_candidate_review_replay(review_replay: dict[str, Any]) -> dict[st
     unavailable_markers = {"aggregated_output_flood", "review_unusable", "review_unavailable", "packet_truncated"}
     blockers = _string_list(review_replay.get("blockers"))
     unavailable_blockers = [blocker for blocker in blockers if blocker.lower() in unavailable_markers]
+    extras: dict[str, Any] = {}
+    if isinstance(review_replay.get("guard"), dict):
+        extras["guard"] = _bound(review_replay["guard"])
 
     if (
         raw_reason in unavailable_markers
@@ -197,6 +214,7 @@ def _normalize_candidate_review_replay(review_replay: dict[str, Any]) -> dict[st
             "must_fix": must_fix,
             "suggestions": suggestions,
             "completion_trusted": False,
+            **extras,
         }
 
     if raw_status == "passed" and not must_fix and not blockers:
@@ -207,6 +225,7 @@ def _normalize_candidate_review_replay(review_replay: dict[str, Any]) -> dict[st
             "must_fix": [],
             "suggestions": suggestions,
             "completion_trusted": False,
+            **extras,
         }
 
     return {
@@ -216,7 +235,104 @@ def _normalize_candidate_review_replay(review_replay: dict[str, Any]) -> dict[st
         "must_fix": must_fix,
         "suggestions": suggestions,
         "completion_trusted": False,
+        **extras,
     }
+
+
+def _build_candidate_review_guard_prompt(review_packet: dict[str, Any]) -> str:
+    packet_text = json.dumps(_bound(_scrub_raw_review_packet_fields(review_packet)), ensure_ascii=False, indent=2)
+    return (
+        "Review only the bounded packet below. Do not run shell commands. "
+        "Do not inspect files directly. Do not request full source or full diffs. "
+        "Return structured review JSON only.\n\n"
+        "<bounded_review_packet>\n"
+        f"{packet_text}\n"
+        "</bounded_review_packet>"
+    )
+
+
+def _normalize_candidate_review_guard_result(guard_result: dict[str, Any]) -> dict[str, Any]:
+    guard_status = str(guard_result.get("status") or "").strip().lower()
+    guard_reason = str(guard_result.get("reason") or "").strip().lower()
+    review = guard_result.get("review") if isinstance(guard_result.get("review"), dict) else {}
+    verdict = str(review.get("verdict") or review.get("status") or guard_status or "").strip().lower()
+    must_fix = _string_list(review.get("must_fix")) or _string_list(guard_result.get("must_fix"))
+    suggestions = _string_list(review.get("suggested_fixes")) or _string_list(guard_result.get("suggestions"))
+    blockers = _string_list(review.get("blockers")) or _string_list(guard_result.get("blockers"))
+    unavailable_markers = {"aggregated_output_flood", "review_unusable", "review_unavailable", "packet_truncated", "unusable", "unavailable"}
+    guard_payload = _bound(guard_result)
+
+    if (
+        guard_status in unavailable_markers
+        or guard_reason in unavailable_markers
+        or verdict in {"unusable", "unavailable", "review_unavailable"}
+        or guard_result.get("review_unusable") is True
+    ):
+        if guard_result.get("review_unusable") is True:
+            blocker = guard_reason or "review_unusable"
+        else:
+            blocker = guard_reason or guard_status or verdict
+        if not blocker:
+            blocker = "review_unavailable"
+        return {
+            "status": "review_unavailable",
+            "reason": blocker,
+            "blockers": _string_list([blocker, *blockers]),
+            "must_fix": must_fix,
+            "suggestions": suggestions,
+            "completion_trusted": False,
+            "guard": guard_payload,
+        }
+
+    if guard_status == "passed" and verdict in {"passed", "pass", "ok", "can_continue", "可以继续"} and not must_fix and not blockers:
+        return {
+            "status": "passed",
+            "reason": "guard_passed",
+            "blockers": [],
+            "must_fix": [],
+            "suggestions": suggestions,
+            "completion_trusted": False,
+            "guard": guard_payload,
+        }
+
+    return {
+        "status": "review_blocked",
+        "reason": guard_reason or guard_status or verdict or "review_blocked",
+        "blockers": must_fix or blockers or [guard_reason or guard_status or verdict or "review_blocked"],
+        "must_fix": must_fix,
+        "suggestions": suggestions,
+        "completion_trusted": False,
+        "guard": guard_payload,
+    }
+
+
+def _run_candidate_review_guard_adapter(*, review_packet: dict[str, Any], guard_runner: Any = None) -> dict[str, Any]:
+    bounded_packet = _bound(_scrub_raw_review_packet_fields(review_packet))
+    if not callable(guard_runner):
+        return {
+            "status": "review_unavailable",
+            "reason": "review_guard_runner_missing",
+            "blockers": ["review_guard_runner_missing"],
+            "completion_trusted": False,
+        }
+    prompt = _build_candidate_review_guard_prompt(bounded_packet)
+    try:
+        guard_result = guard_runner(prompt=prompt, review_packet=bounded_packet)
+    except Exception:
+        return {
+            "status": "review_unavailable",
+            "reason": "review_guard_exception",
+            "blockers": ["review_guard_exception"],
+            "completion_trusted": False,
+        }
+    if not isinstance(guard_result, dict):
+        return {
+            "status": "review_unavailable",
+            "reason": "invalid_review_guard_result",
+            "blockers": ["invalid_review_guard_result"],
+            "completion_trusted": False,
+        }
+    return _normalize_candidate_review_guard_result(guard_result)
 
 
 def _run_candidate_review_once(
@@ -251,7 +367,7 @@ def _run_candidate_review_once(
             "completion_trusted": False,
         }
 
-    review_packet = _bound(review_handoff.get("review_packet") if isinstance(review_handoff, dict) else {})
+    review_packet = _bound(_scrub_raw_review_packet_fields(review_handoff.get("review_packet") if isinstance(review_handoff, dict) else {}))
     try:
         review_result = review_runner(review_packet=review_packet)
     except Exception:
@@ -1311,7 +1427,13 @@ def codex_goal_run(args: dict[str, Any]) -> str:
         review_replay = args.get("review_replay") if isinstance(args.get("review_replay"), dict) else None
         review_runner_enabled = args.get("review_runner_enabled") is True
         allow_real_review = args.get("allow_real_review") is True
+        review_guard_enabled = args.get("review_guard_enabled") is True
         review_runner = _REAL_CANDIDATE_REVIEW_RUNNER
+        if review_guard_enabled:
+            review_runner = lambda *, review_packet: _run_candidate_review_guard_adapter(
+                review_packet=review_packet,
+                guard_runner=_REAL_CANDIDATE_REVIEW_GUARD_RUNNER,
+            )
         review = _run_candidate_review_once(
             review_handoff=review_handoff,
             review_runner_enabled=review_runner_enabled,
@@ -1325,6 +1447,10 @@ def codex_goal_run(args: dict[str, Any]) -> str:
             codex_reason = "review_candidate_disabled"
         elif not allow_real_review:
             codex_reason = "review_candidate_not_authorized"
+        elif review_guard_enabled and review.get("reason") == "review_guard_runner_missing":
+            codex_reason = "review_candidate_guard_runner_missing"
+        elif review_guard_enabled:
+            codex_reason = "review_candidate_guard_adapter"
         elif review.get("status") == "review_runner_missing":
             codex_reason = "review_candidate_runner_missing"
         else:
@@ -1574,6 +1700,7 @@ _SCHEMA = {
             "allow_real_adapter": {"type": "boolean"},
             "review_runner_enabled": {"type": "boolean"},
             "allow_real_review": {"type": "boolean"},
+            "review_guard_enabled": {"type": "boolean"},
             "review_replay": {"type": "object"},
         },
         "required": ["workdir", "stage_id", "objective", "mode", "dirty_baseline_policy"],
