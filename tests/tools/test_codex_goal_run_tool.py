@@ -527,6 +527,7 @@ def test_review_candidate_runner_receives_bounded_packet(tmp_path, monkeypatch):
 
 
 def test_review_candidate_guard_disabled_does_not_call_guard_runner(tmp_path, monkeypatch):
+    assert tool._REAL_CANDIDATE_REVIEW_GUARD_RUNNER is None
     repo = _clean_repo(tmp_path)
     (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
     calls = []
@@ -748,6 +749,252 @@ def test_review_guard_adapter_scrubs_raw_log_fields_before_prompt_and_runner():
     assert "raw_tui_log" not in serialized_packet
     assert "raw_log" not in serialized_packet
     assert calls[0]["review_packet"]["nested"]["safe"] == "keep"
+
+
+def test_review_guard_subprocess_runner_uses_review_packet_file_and_no_tui_command(tmp_path):
+    guard_script = tmp_path / "codex_review_guard.py"
+    guard_script.write_text("# fake guard script\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append({"argv": argv, "kwargs": kwargs})
+        packet_file = Path(argv[argv.index("--review-packet-file") + 1])
+        packet = json.loads(packet_file.read_text(encoding="utf-8"))
+        assert packet["stage_id"] == "slice-7e"
+        assert packet["nested"]["safe"] == "keep"
+        assert "raw_log" not in json.dumps(packet, ensure_ascii=False)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "status": "passed",
+                "reason": "ok",
+                "review": {
+                    "verdict": "passed",
+                    "summary": "packet subprocess ok",
+                    "must_fix": [],
+                    "suggested_fixes": [],
+                    "verification_commands": [],
+                    "final_judgment": "可以继续",
+                },
+            }),
+            stderr="",
+        )
+
+    result = tool._run_candidate_review_guard_adapter(
+        review_packet={"stage_id": "slice-7e", "nested": {"raw_log": "SECRET", "safe": "keep"}},
+        guard_runner=lambda *, prompt, review_packet: tool._run_candidate_review_guard_subprocess(
+            prompt=prompt,
+            review_packet=review_packet,
+            workdir=tmp_path,
+            guard_script=guard_script,
+            subprocess_runner=fake_run,
+            artifact_dir=tmp_path / "artifacts",
+        ),
+    )
+
+    assert result["status"] == "passed"
+    assert len(calls) == 1
+    argv = calls[0]["argv"]
+    assert "--review-packet-file" in argv
+    assert "--prompt-file" in argv
+    assert "--raw-log" in argv
+    assert "--final-file" in argv
+    command_text = " ".join(map(str, argv))
+    assert "--enable goals" not in command_text
+    assert "codex-yuna --enable goals" not in command_text
+    assert calls[0]["kwargs"]["shell"] is False
+    assert result["guard"]["runner"]["status"] == "completed"
+    assert "raw_log_path" in result["guard"]["runner"]
+    assert "SECRET" not in json.dumps(result["guard"], ensure_ascii=False)
+
+
+def test_review_guard_subprocess_missing_script_is_review_unavailable(tmp_path):
+    result = tool._run_candidate_review_guard_adapter(
+        review_packet={"stage_id": "slice-7e"},
+        guard_runner=lambda *, prompt, review_packet: tool._run_candidate_review_guard_subprocess(
+            prompt=prompt,
+            review_packet=review_packet,
+            workdir=tmp_path,
+            guard_script=tmp_path / "missing_guard.py",
+            artifact_dir=tmp_path / "artifacts",
+        ),
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["reason"] == "review_guard_script_missing"
+    assert "review_guard_script_missing" in result["blockers"]
+
+
+def test_review_guard_subprocess_nonzero_without_json_is_review_unavailable(tmp_path):
+    guard_script = tmp_path / "codex_review_guard.py"
+    guard_script.write_text("# fake guard script\n", encoding="utf-8")
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(returncode=2, stdout="not json", stderr="boom")
+
+    result = tool._run_candidate_review_guard_adapter(
+        review_packet={"stage_id": "slice-7e"},
+        guard_runner=lambda *, prompt, review_packet: tool._run_candidate_review_guard_subprocess(
+            prompt=prompt,
+            review_packet=review_packet,
+            workdir=tmp_path,
+            guard_script=guard_script,
+            subprocess_runner=fake_run,
+            artifact_dir=tmp_path / "artifacts",
+        ),
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["reason"] == "review_guard_output_not_json"
+    assert result["guard"]["runner"]["codex_exit_code"] == 2
+    assert result["guard"]["runner"]["stderr_chars"] == 4
+    assert "boom" not in json.dumps(result["guard"], ensure_ascii=False)
+
+
+def test_review_guard_subprocess_scrubs_stdout_stderr_and_parsed_raw_fields(tmp_path):
+    guard_script = tmp_path / "codex_review_guard.py"
+    guard_script.write_text("# fake guard script\n", encoding="utf-8")
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "status": "passed",
+                "raw_log": "SECRET_STDOUT_RAW",
+                "review": {
+                    "verdict": "passed",
+                    "summary": "ok",
+                    "must_fix": [],
+                    "suggested_fixes": [],
+                    "verification_commands": [],
+                    "final_judgment": "可以继续",
+                    "raw_tui_log": "SECRET_REVIEW_RAW",
+                },
+            }),
+            stderr="SECRET_STDERR_RAW",
+        )
+
+    result = tool._run_candidate_review_guard_adapter(
+        review_packet={"stage_id": "slice-7e"},
+        guard_runner=lambda *, prompt, review_packet: tool._run_candidate_review_guard_subprocess(
+            prompt=prompt,
+            review_packet=review_packet,
+            workdir=tmp_path,
+            guard_script=guard_script,
+            subprocess_runner=fake_run,
+            artifact_dir=tmp_path / "artifacts",
+        ),
+    )
+
+    assert result["status"] == "passed"
+    serialized = json.dumps(result["guard"], ensure_ascii=False)
+    assert "SECRET_STDOUT_RAW" not in serialized
+    assert "SECRET_STDERR_RAW" not in serialized
+    assert "SECRET_REVIEW_RAW" not in serialized
+    assert result["guard"]["runner"]["stderr_chars"] == len("SECRET_STDERR_RAW")
+
+
+def test_review_guard_subprocess_nonzero_pass_is_review_unavailable(tmp_path):
+    guard_script = tmp_path / "codex_review_guard.py"
+    guard_script.write_text("# fake guard script\n", encoding="utf-8")
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(
+            returncode=2,
+            stdout=json.dumps({
+                "status": "passed",
+                "review": {
+                    "verdict": "passed",
+                    "summary": "claimed pass despite nonzero",
+                    "must_fix": [],
+                    "suggested_fixes": [],
+                    "verification_commands": [],
+                    "final_judgment": "可以继续",
+                },
+            }),
+            stderr="",
+        )
+
+    result = tool._run_candidate_review_guard_adapter(
+        review_packet={"stage_id": "slice-7e"},
+        guard_runner=lambda *, prompt, review_packet: tool._run_candidate_review_guard_subprocess(
+            prompt=prompt,
+            review_packet=review_packet,
+            workdir=tmp_path,
+            guard_script=guard_script,
+            subprocess_runner=fake_run,
+            artifact_dir=tmp_path / "artifacts",
+        ),
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["reason"] == "review_guard_exit_nonzero"
+    assert "review_guard_exit_nonzero" in result["blockers"]
+
+
+def test_review_guard_subprocess_exception_is_review_unavailable(tmp_path):
+    guard_script = tmp_path / "codex_review_guard.py"
+    guard_script.write_text("# fake guard script\n", encoding="utf-8")
+
+    def fake_run(argv, **kwargs):
+        raise RuntimeError("SECRET_EXCEPTION_RAW")
+
+    result = tool._run_candidate_review_guard_adapter(
+        review_packet={"stage_id": "slice-7e"},
+        guard_runner=lambda *, prompt, review_packet: tool._run_candidate_review_guard_subprocess(
+            prompt=prompt,
+            review_packet=review_packet,
+            workdir=tmp_path,
+            guard_script=guard_script,
+            subprocess_runner=fake_run,
+            artifact_dir=tmp_path / "artifacts",
+        ),
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["reason"] == "review_guard_subprocess_exception"
+    assert "SECRET_EXCEPTION_RAW" not in json.dumps(result["guard"], ensure_ascii=False)
+
+
+def test_review_guard_subprocess_unusable_flood_is_review_unavailable(tmp_path):
+    guard_script = tmp_path / "codex_review_guard.py"
+    guard_script.write_text("# fake guard script\n", encoding="utf-8")
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(
+            returncode=2,
+            stdout=json.dumps({
+                "status": "unusable",
+                "reason": "aggregated_output_flood",
+                "stdout_chars": 999999,
+                "raw_log_path": "/tmp/raw.log",
+                "review": {
+                    "verdict": "unusable",
+                    "summary": "flood",
+                    "must_fix": [],
+                    "suggested_fixes": [],
+                    "verification_commands": [],
+                    "final_judgment": "需要重试",
+                },
+            }),
+            stderr="",
+        )
+
+    result = tool._run_candidate_review_guard_adapter(
+        review_packet={"stage_id": "slice-7e"},
+        guard_runner=lambda *, prompt, review_packet: tool._run_candidate_review_guard_subprocess(
+            prompt=prompt,
+            review_packet=review_packet,
+            workdir=tmp_path,
+            guard_script=guard_script,
+            subprocess_runner=fake_run,
+            artifact_dir=tmp_path / "artifacts",
+        ),
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["reason"] == "aggregated_output_flood"
+    assert "aggregated_output_flood" in result["blockers"]
 
 
 def test_codex_goals_preflight_uses_features_list(monkeypatch):

@@ -2,6 +2,8 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -304,6 +306,137 @@ def _normalize_candidate_review_guard_result(guard_result: dict[str, Any]) -> di
         "completion_trusted": False,
         "guard": guard_payload,
     }
+
+
+def _run_candidate_review_guard_subprocess(
+    *,
+    prompt: str,
+    review_packet: dict[str, Any],
+    workdir: str | Path | None = None,
+    guard_script: str | Path | None = None,
+    subprocess_runner: Any = None,
+    artifact_dir: str | Path | None = None,
+    timeout_seconds: int = 900,
+) -> dict[str, Any]:
+    """Run the existing codex_review_guard.py behind a packet-only wrapper.
+
+    This function is intentionally not wired into the default runtime hook. It is
+    only used when explicitly injected as the guard runner.
+    """
+    bounded_packet = _bound(_scrub_raw_review_packet_fields(review_packet))
+    repo_workdir = Path(workdir or bounded_packet.get("workdir") or ".").expanduser().resolve()
+    script_path = (
+        Path(guard_script).expanduser().resolve()
+        if guard_script is not None
+        else Path(__file__).resolve().parents[1] / "scripts" / "runtime" / "codex_review_guard.py"
+    )
+    if not script_path.is_file():
+        return {
+            "status": "unusable",
+            "reason": "review_guard_script_missing",
+            "blockers": ["review_guard_script_missing"],
+            "runner": {"status": "not_run", "guard_script": str(script_path)},
+        }
+
+    if artifact_dir is None:
+        run_dir = Path(tempfile.mkdtemp(prefix="codex-goal-review-guard-", dir=str(_TMP_ROOT)))
+    else:
+        run_dir = Path(artifact_dir).expanduser().resolve()
+        run_dir.mkdir(parents=True, exist_ok=True)
+    prompt_file = run_dir / "review-prompt.md"
+    packet_file = run_dir / "review-packet.json"
+    raw_log_path = run_dir / "raw.log"
+    final_file = run_dir / "final.json"
+
+    base_prompt = str(prompt or "").split("<bounded_review_packet>", 1)[0].strip()
+    if not base_prompt:
+        base_prompt = "Review only the bounded packet. Do not run shell commands. Return structured review JSON only."
+    prompt_file.write_text(base_prompt + "\n", encoding="utf-8")
+    packet_file.write_text(json.dumps(bounded_packet, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--prompt-file",
+        str(prompt_file),
+        "--workdir",
+        str(repo_workdir),
+        "--review-packet-file",
+        str(packet_file),
+        "--raw-log",
+        str(raw_log_path),
+        "--final-file",
+        str(final_file),
+        "--timeout-seconds",
+        str(int(timeout_seconds)),
+    ]
+    runner = subprocess_runner or subprocess.run
+    try:
+        proc = runner(
+            cmd,
+            cwd=str(repo_workdir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(1, int(timeout_seconds) + 5),
+            shell=False,
+        )
+    except Exception:
+        return {
+            "status": "unusable",
+            "reason": "review_guard_subprocess_exception",
+            "blockers": ["review_guard_subprocess_exception"],
+            "runner": {
+                "status": "exception",
+                "guard_script": str(script_path),
+                "review_packet_file": str(packet_file),
+                "raw_log_path": str(raw_log_path),
+                "final_file": str(final_file),
+            },
+        }
+
+    stdout = str(getattr(proc, "stdout", "") or "")
+    stderr = str(getattr(proc, "stderr", "") or "")
+    returncode = int(getattr(proc, "returncode", 2))
+    runner_meta = {
+        "status": "completed",
+        "guard_script": str(script_path),
+        "review_packet_file": str(packet_file),
+        "raw_log_path": str(raw_log_path),
+        "final_file": str(final_file),
+        "codex_exit_code": returncode,
+        "stdout_chars": len(stdout),
+        "stdout_sha256": hashlib.sha256(stdout.encode("utf-8", errors="replace")).hexdigest()[:24],
+        "stderr_chars": len(stderr),
+        "stderr_sha256": hashlib.sha256(stderr.encode("utf-8", errors="replace")).hexdigest()[:24],
+    }
+
+    try:
+        parsed = json.loads(stdout.strip()) if stdout.strip() else None
+    except json.JSONDecodeError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        return {
+            "status": "unusable",
+            "reason": "review_guard_output_not_json",
+            "blockers": ["review_guard_output_not_json"],
+            "runner": runner_meta,
+        }
+
+    result = _bound(_scrub_raw_review_packet_fields(parsed))
+    if not isinstance(result, dict):
+        return {
+            "status": "unusable",
+            "reason": "review_guard_output_not_object",
+            "blockers": ["review_guard_output_not_object"],
+            "runner": runner_meta,
+        }
+    result["runner"] = runner_meta
+    if returncode != 0 and str(result.get("status") or "").strip().lower() == "passed":
+        result["status"] = "unusable"
+        result["reason"] = "review_guard_exit_nonzero"
+        result["blockers"] = _string_list(["review_guard_exit_nonzero", *(_string_list(result.get("blockers")))])
+    return result
 
 
 def _run_candidate_review_guard_adapter(*, review_packet: dict[str, Any], guard_runner: Any = None) -> dict[str, Any]:
