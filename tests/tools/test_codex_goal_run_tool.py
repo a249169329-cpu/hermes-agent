@@ -741,7 +741,6 @@ def test_compose_goal_snapshot_replay_feeds_existing_classifier(tmp_path):
     assert classified["candidate_evidence"]["untracked_files"] == ["new.py"]
 
 
-@pytest.mark.xfail(reason="Slice 4D pending: adapter stop condition contract is not implemented yet", strict=True)
 def test_goal_adapter_stop_condition_stops_when_candidate_ready():
     stop = tool._goal_adapter_stop_condition(
         {
@@ -758,7 +757,23 @@ def test_goal_adapter_stop_condition_stops_when_candidate_ready():
     }
 
 
-@pytest.mark.xfail(reason="Slice 4D pending: default adapter runner gate is not implemented yet", strict=True)
+def test_goal_adapter_stop_condition_preserves_specific_blocked_reason():
+    for result_status in ["failed", "needs_attention", "process_missing"]:
+        stop = tool._goal_adapter_stop_condition(
+            {
+                "result_status": result_status,
+                "classification": "blocked",
+                "completion_trusted": False,
+            }
+        )
+
+        assert stop == {
+            "should_stop": True,
+            "reason": result_status,
+            "completion_trusted": False,
+        }
+
+
 def test_run_goal_adapter_once_default_disabled_does_not_call_runners(tmp_path):
     calls = []
 
@@ -784,7 +799,6 @@ def test_run_goal_adapter_once_default_disabled_does_not_call_runners(tmp_path):
     assert result["completion_trusted"] is False
 
 
-@pytest.mark.xfail(reason="Slice 4D pending: explicit authorization gate is not implemented yet", strict=True)
 def test_run_goal_adapter_once_requires_explicit_authorization_before_runner_calls(tmp_path):
     calls = []
 
@@ -809,7 +823,6 @@ def test_run_goal_adapter_once_requires_explicit_authorization_before_runner_cal
     assert result["completion_trusted"] is False
 
 
-@pytest.mark.xfail(reason="Slice 4D pending: injected runner interface is not implemented yet", strict=True)
 def test_run_goal_adapter_once_authorized_injected_runners_feed_classifier(tmp_path):
     calls = []
 

@@ -646,6 +646,137 @@ def _classify_goal_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _goal_adapter_stop_condition(classification: dict[str, Any]) -> dict[str, Any]:
+    completion_trusted = bool(classification.get("completion_trusted", False))
+    result_status = str(classification.get("result_status") or "")
+    next_action = str(classification.get("next_action") or "")
+    state = str(classification.get("classification") or "")
+
+    if result_status == "completed" and next_action == "collect_candidate_for_hermes_review":
+        return {
+            "should_stop": True,
+            "reason": "candidate_ready_for_review",
+            "completion_trusted": completion_trusted,
+        }
+
+    if result_status in {"failed", "needs_attention", "process_missing"}:
+        return {
+            "should_stop": True,
+            "reason": result_status,
+            "completion_trusted": completion_trusted,
+        }
+
+    if state == "blocked":
+        return {
+            "should_stop": True,
+            "reason": "blocked",
+            "completion_trusted": completion_trusted,
+        }
+
+    return {
+        "should_stop": False,
+        "reason": "continue_monitoring",
+        "completion_trusted": completion_trusted,
+    }
+
+
+def _run_goal_adapter_once(
+    *,
+    session_id: str,
+    repo: Path,
+    wait_seconds: int,
+    wait_windows: int | None = None,
+    idle_windows: int | None = None,
+    adapter_enabled: bool = False,
+    allow_real_adapter: bool = False,
+    process_runner: Any = None,
+    git_runner: Any = None,
+) -> dict[str, Any]:
+    if not adapter_enabled:
+        snapshot = _compose_goal_snapshot(
+            session_id=session_id,
+            repo=repo,
+            wait_seconds=wait_seconds,
+            wait_windows=wait_windows,
+            idle_windows=idle_windows,
+        )
+        classification = _classify_goal_snapshot(snapshot)
+        return {
+            "status": "adapter_disabled",
+            "adapter_status": "disabled",
+            "blockers": ["real_adapter_disabled"],
+            "snapshot": snapshot,
+            "classification": classification,
+            "stop_condition": _goal_adapter_stop_condition(classification),
+            "completion_trusted": False,
+        }
+
+    if not allow_real_adapter:
+        snapshot = _compose_goal_snapshot(
+            session_id=session_id,
+            repo=repo,
+            wait_seconds=wait_seconds,
+            wait_windows=wait_windows,
+            idle_windows=idle_windows,
+        )
+        classification = _classify_goal_snapshot(snapshot)
+        return {
+            "status": "real_adapter_not_authorized",
+            "adapter_status": "blocked",
+            "blockers": ["real_adapter_not_authorized"],
+            "snapshot": snapshot,
+            "classification": classification,
+            "stop_condition": _goal_adapter_stop_condition(classification),
+            "completion_trusted": False,
+        }
+
+    blockers = []
+    if not callable(process_runner):
+        blockers.append("missing_process_runner")
+    if not callable(git_runner):
+        blockers.append("missing_git_runner")
+    if blockers:
+        snapshot = _compose_goal_snapshot(
+            session_id=session_id,
+            repo=repo,
+            wait_seconds=wait_seconds,
+            wait_windows=wait_windows,
+            idle_windows=idle_windows,
+        )
+        classification = _classify_goal_snapshot(snapshot)
+        return {
+            "status": "real_adapter_runner_missing",
+            "adapter_status": "blocked",
+            "blockers": blockers,
+            "snapshot": snapshot,
+            "classification": classification,
+            "stop_condition": _goal_adapter_stop_condition(classification),
+            "completion_trusted": False,
+        }
+
+    process_replay = process_runner(session_id=session_id, wait_seconds=wait_seconds)
+    git_replay = git_runner(repo=repo)
+    snapshot = _compose_goal_snapshot(
+        session_id=session_id,
+        repo=repo,
+        wait_seconds=wait_seconds,
+        wait_windows=wait_windows,
+        idle_windows=idle_windows,
+        process_replay=process_replay,
+        git_replay=git_replay,
+    )
+    classification = _classify_goal_snapshot(snapshot)
+    return {
+        "status": classification["result_status"],
+        "adapter_status": "injected",
+        "blockers": [],
+        "snapshot": snapshot,
+        "classification": classification,
+        "stop_condition": _goal_adapter_stop_condition(classification),
+        "completion_trusted": False,
+    }
+
+
 def _monitor_goal_session(args: dict[str, Any]) -> dict[str, Any]:
     session_id = str(args.get("session_id") or "").strip()
     interval = _coerce_positive_int(args.get("monitor_interval_seconds"), default=30, minimum=1, maximum=300)
