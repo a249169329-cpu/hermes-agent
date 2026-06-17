@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import toolsets
 from tools import codex_goal_run_tool as tool
 from tools.registry import registry
@@ -410,6 +411,135 @@ def test_monitor_goal_requires_session_id_before_polling(tmp_path, monkeypatch):
     assert result["classification"] == "blocked"
     assert result["next_action"] == "provide_session_id_from_launch_goal"
     assert polls == []
+
+
+@pytest.mark.xfail(reason="Slice 4 pending: bounded log tail contract is not implemented yet", strict=True)
+def test_bounded_log_tail_limits_lines_and_chars_without_raw_flood():
+    raw = "\n".join(f"line-{index:02d}-" + "x" * 20 for index in range(12))
+
+    tail = tool._bounded_log_tail(raw, max_lines=3, max_chars=80)
+
+    assert tail["line_count"] == 12
+    assert tail["included_lines"] == 3
+    assert tail["omitted_lines"] == 9
+    assert tail["char_count"] == len(raw)
+    assert tail["included_chars"] <= 80
+    assert tail["omitted_chars"] == len(raw) - tail["included_chars"]
+    assert tail["truncated"] is True
+    assert "line-11" in tail["text"]
+    assert "line-00" not in tail["text"]
+
+
+@pytest.mark.xfail(reason="Slice 4 pending: process-missing classifier is not implemented yet", strict=True)
+def test_classify_goal_snapshot_reports_process_missing_without_guessing():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-missing",
+            "process": {"found": False},
+            "log": {"raw": ""},
+            "git": {"is_clean": True, "changed_files": [], "staged_files": [], "untracked_files": []},
+        }
+    )
+
+    assert result["result_status"] == "process_missing"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "planning_only"
+    assert result["next_action"] == "inspect_process_registry"
+    assert result["monitor"]["state"] == "process_missing"
+    assert result["monitor"]["session_id"] == "session-missing"
+
+
+@pytest.mark.xfail(reason="Slice 4 pending: running-output classifier is not implemented yet", strict=True)
+def test_classify_goal_snapshot_running_output_is_not_idle():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": True, "exit_code": None},
+            "log": {"new_output": "working", "raw": "thinking\nworking"},
+            "git": {"is_clean": True, "changed_files": [], "staged_files": [], "untracked_files": []},
+            "wait_windows": 2,
+            "idle_windows": 0,
+        }
+    )
+
+    assert result["result_status"] == "running"
+    assert result["classification"] == "monitoring"
+    assert result["candidate_disposition"] == "running"
+    assert result["next_action"] == "continue_monitoring_goal"
+    assert result["monitor"]["state"] == "running"
+    assert result["monitor"]["last_output"] == "working"
+    assert result["monitor"]["log_tail"]["text"].endswith("working")
+
+
+@pytest.mark.xfail(reason="Slice 4 pending: pasted-content classifier is not implemented yet", strict=True)
+def test_classify_goal_snapshot_pasted_content_needs_attention_without_killing_process():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": True, "exit_code": None},
+            "log": {"new_output": "", "raw": "[Pasted Content]\ncomposer waiting"},
+            "git": {"is_clean": True, "changed_files": [], "staged_files": [], "untracked_files": []},
+            "wait_windows": 3,
+            "idle_windows": 3,
+        }
+    )
+
+    assert result["result_status"] == "needs_attention"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "running"
+    assert result["next_action"] == "send_raw_enter_or_ask"
+    assert result["monitor"]["state"] == "pasted_content_suspected"
+    assert result["monitor"]["pasted_content_suspected"] is True
+
+
+@pytest.mark.xfail(reason="Slice 4 pending: exited-with-untracked classifier is not implemented yet", strict=True)
+def test_classify_goal_snapshot_completed_keeps_untracked_candidate_evidence():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": False, "exit_code": 0},
+            "log": {"new_output": "Goal achieved", "raw": "work\nGoal achieved"},
+            "git": {
+                "is_clean": False,
+                "changed_files": [],
+                "staged_files": [],
+                "untracked_files": ["new_module.py"],
+                "diff_stat": "",
+                "staged_diff_stat": "",
+            },
+            "wait_windows": 4,
+            "idle_windows": 0,
+        }
+    )
+
+    assert result["result_status"] == "completed"
+    assert result["classification"] == "monitoring"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "collect_candidate_for_hermes_review"
+    assert result["monitor"]["state"] == "completed"
+    assert result["monitor"]["goal_achieved_seen"] is True
+    assert result["candidate_evidence"]["untracked_files"] == ["new_module.py"]
+    assert result["completion_trusted"] is False
+
+
+@pytest.mark.xfail(reason="Slice 4 pending: exited-clean classifier is not implemented yet", strict=True)
+def test_classify_goal_snapshot_exited_clean_needs_attention_not_success():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": False, "exit_code": 0},
+            "log": {"new_output": "", "raw": ""},
+            "git": {"is_clean": True, "changed_files": [], "staged_files": [], "untracked_files": []},
+            "wait_windows": 1,
+            "idle_windows": 1,
+        }
+    )
+
+    assert result["result_status"] == "needs_attention"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "planning_only"
+    assert result["next_action"] == "inspect_no_diff_exit"
+    assert result["monitor"]["state"] == "process_exited_no_diff"
 
 
 def test_missing_goals_feature_is_reported_as_preflight_blocker(tmp_path, monkeypatch):
