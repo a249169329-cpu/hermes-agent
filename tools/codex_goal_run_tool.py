@@ -377,6 +377,167 @@ def _poll_goal_session(*, session_id: str, wait_seconds: int) -> dict[str, Any]:
     }
 
 
+def _bounded_log_tail(raw: str, *, max_lines: int, max_chars: int) -> dict[str, Any]:
+    text = raw if isinstance(raw, str) else str(raw or "")
+    lines = text.splitlines()
+    line_count = len(lines)
+    limited_lines = lines[-max(0, max_lines) :] if max_lines > 0 else []
+    tail = "\n".join(limited_lines)
+    if max_chars >= 0 and len(tail) > max_chars:
+        tail = tail[-max_chars:] if max_chars else ""
+    included_chars = len(tail)
+    return {
+        "text": tail,
+        "line_count": line_count,
+        "included_lines": len(limited_lines),
+        "omitted_lines": max(0, line_count - len(limited_lines)),
+        "char_count": len(text),
+        "included_chars": included_chars,
+        "omitted_chars": max(0, len(text) - included_chars),
+        "truncated": line_count > len(limited_lines) or len(text) > included_chars,
+    }
+
+
+def _classify_goal_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    session_id = str(snapshot.get("session_id") or "")
+    process = snapshot.get("process") if isinstance(snapshot.get("process"), dict) else {}
+    log = snapshot.get("log") if isinstance(snapshot.get("log"), dict) else {}
+    git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
+    raw_log = str(log.get("raw") or "")
+    new_output = str(log.get("new_output") or "")
+    log_tail = _bounded_log_tail(raw_log, max_lines=40, max_chars=4000)
+    combined_log = f"{raw_log}\n{new_output}".lower()
+    goal_achieved_seen = "goal achieved" in combined_log
+    pasted_content_suspected = "[pasted content]" in combined_log
+    wait_windows = snapshot.get("wait_windows")
+    idle_windows = snapshot.get("idle_windows")
+
+    changed_files = _string_list(git.get("changed_files"))
+    staged_files = _string_list(git.get("staged_files"))
+    untracked_files = _string_list(git.get("untracked_files"))
+    candidate_evidence = {
+        "changed_files": changed_files,
+        "staged_files": staged_files,
+        "untracked_files": untracked_files,
+        "diff_stat": str(git.get("diff_stat") or ""),
+        "staged_diff_stat": str(git.get("staged_diff_stat") or ""),
+    }
+    has_candidate_evidence = bool(changed_files or staged_files or untracked_files)
+    still_running = bool(process.get("still_running"))
+    exit_code = process.get("exit_code")
+
+    def monitor(state: str, **extra: Any) -> dict[str, Any]:
+        data = {
+            "session_id": session_id,
+            "state": state,
+            "wait_windows": wait_windows,
+            "idle_windows": idle_windows,
+            "log_tail": log_tail,
+        }
+        if new_output:
+            data["last_output"] = new_output
+        data.update(extra)
+        return data
+
+    if process.get("found") is False:
+        return {
+            "result_status": "process_missing",
+            "classification": "blocked",
+            "candidate_disposition": "planning_only",
+            "next_action": "inspect_process_registry",
+            "completion_trusted": False,
+            "monitor": monitor("process_missing"),
+            "candidate_evidence": candidate_evidence,
+        }
+
+    if not still_running and exit_code not in (None, 0):
+        return {
+            "result_status": "failed",
+            "classification": "blocked",
+            "candidate_disposition": "needs_review",
+            "next_action": "inspect_goal_failure",
+            "completion_trusted": False,
+            "monitor": monitor("failed", exit_code=exit_code, goal_achieved_seen=goal_achieved_seen),
+            "candidate_evidence": candidate_evidence,
+        }
+
+    if goal_achieved_seen and has_candidate_evidence:
+        return {
+            "result_status": "completed",
+            "classification": "monitoring",
+            "candidate_disposition": "needs_review",
+            "next_action": "collect_candidate_for_hermes_review",
+            "completion_trusted": False,
+            "monitor": monitor("completed", goal_achieved_seen=True, exit_code=exit_code),
+            "candidate_evidence": candidate_evidence,
+        }
+
+    if still_running and pasted_content_suspected and not has_candidate_evidence:
+        return {
+            "result_status": "needs_attention",
+            "classification": "blocked",
+            "candidate_disposition": "running",
+            "next_action": "send_raw_enter_or_ask",
+            "completion_trusted": False,
+            "monitor": monitor("pasted_content_suspected", pasted_content_suspected=True),
+            "candidate_evidence": candidate_evidence,
+        }
+
+    if still_running and new_output:
+        return {
+            "result_status": "running",
+            "classification": "monitoring",
+            "candidate_disposition": "running",
+            "next_action": "continue_monitoring_goal",
+            "completion_trusted": False,
+            "monitor": monitor("running"),
+            "candidate_evidence": candidate_evidence,
+        }
+
+    if still_running and not has_candidate_evidence:
+        return {
+            "result_status": "idle_wait",
+            "classification": "monitoring",
+            "candidate_disposition": "running",
+            "next_action": "continue_monitoring_or_inspect_tui",
+            "completion_trusted": False,
+            "monitor": monitor("idle", recommendation="continue_monitoring_or_inspect_tui"),
+            "candidate_evidence": candidate_evidence,
+        }
+
+    if not still_running and exit_code == 0 and has_candidate_evidence:
+        return {
+            "result_status": "completed",
+            "classification": "monitoring",
+            "candidate_disposition": "needs_review",
+            "next_action": "collect_candidate_for_hermes_review",
+            "completion_trusted": False,
+            "monitor": monitor("completed", goal_achieved_seen=goal_achieved_seen, exit_code=exit_code),
+            "candidate_evidence": candidate_evidence,
+        }
+
+    if not still_running and exit_code == 0:
+        return {
+            "result_status": "needs_attention",
+            "classification": "blocked",
+            "candidate_disposition": "planning_only",
+            "next_action": "inspect_no_diff_exit",
+            "completion_trusted": False,
+            "monitor": monitor("process_exited_no_diff", exit_code=exit_code),
+            "candidate_evidence": candidate_evidence,
+        }
+
+    return {
+        "result_status": "running" if still_running else "needs_attention",
+        "classification": "monitoring" if still_running else "blocked",
+        "candidate_disposition": "running" if still_running else "needs_review",
+        "next_action": "continue_monitoring_goal" if still_running else "inspect_goal_failure",
+        "completion_trusted": False,
+        "monitor": monitor("running" if still_running else "failed", exit_code=exit_code),
+        "candidate_evidence": candidate_evidence,
+    }
+
+
 def _monitor_goal_session(args: dict[str, Any]) -> dict[str, Any]:
     session_id = str(args.get("session_id") or "").strip()
     interval = _coerce_positive_int(args.get("monitor_interval_seconds"), default=30, minimum=1, maximum=300)

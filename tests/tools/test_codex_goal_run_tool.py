@@ -413,7 +413,6 @@ def test_monitor_goal_requires_session_id_before_polling(tmp_path, monkeypatch):
     assert polls == []
 
 
-@pytest.mark.xfail(reason="Slice 4 pending: bounded log tail contract is not implemented yet", strict=True)
 def test_bounded_log_tail_limits_lines_and_chars_without_raw_flood():
     raw = "\n".join(f"line-{index:02d}-" + "x" * 20 for index in range(12))
 
@@ -430,7 +429,6 @@ def test_bounded_log_tail_limits_lines_and_chars_without_raw_flood():
     assert "line-00" not in tail["text"]
 
 
-@pytest.mark.xfail(reason="Slice 4 pending: process-missing classifier is not implemented yet", strict=True)
 def test_classify_goal_snapshot_reports_process_missing_without_guessing():
     result = tool._classify_goal_snapshot(
         {
@@ -449,7 +447,6 @@ def test_classify_goal_snapshot_reports_process_missing_without_guessing():
     assert result["monitor"]["session_id"] == "session-missing"
 
 
-@pytest.mark.xfail(reason="Slice 4 pending: running-output classifier is not implemented yet", strict=True)
 def test_classify_goal_snapshot_running_output_is_not_idle():
     result = tool._classify_goal_snapshot(
         {
@@ -471,7 +468,6 @@ def test_classify_goal_snapshot_running_output_is_not_idle():
     assert result["monitor"]["log_tail"]["text"].endswith("working")
 
 
-@pytest.mark.xfail(reason="Slice 4 pending: pasted-content classifier is not implemented yet", strict=True)
 def test_classify_goal_snapshot_pasted_content_needs_attention_without_killing_process():
     result = tool._classify_goal_snapshot(
         {
@@ -492,7 +488,6 @@ def test_classify_goal_snapshot_pasted_content_needs_attention_without_killing_p
     assert result["monitor"]["pasted_content_suspected"] is True
 
 
-@pytest.mark.xfail(reason="Slice 4 pending: exited-with-untracked classifier is not implemented yet", strict=True)
 def test_classify_goal_snapshot_completed_keeps_untracked_candidate_evidence():
     result = tool._classify_goal_snapshot(
         {
@@ -522,7 +517,6 @@ def test_classify_goal_snapshot_completed_keeps_untracked_candidate_evidence():
     assert result["completion_trusted"] is False
 
 
-@pytest.mark.xfail(reason="Slice 4 pending: exited-clean classifier is not implemented yet", strict=True)
 def test_classify_goal_snapshot_exited_clean_needs_attention_not_success():
     result = tool._classify_goal_snapshot(
         {
@@ -540,6 +534,127 @@ def test_classify_goal_snapshot_exited_clean_needs_attention_not_success():
     assert result["candidate_disposition"] == "planning_only"
     assert result["next_action"] == "inspect_no_diff_exit"
     assert result["monitor"]["state"] == "process_exited_no_diff"
+
+
+def test_classify_goal_snapshot_exited_nonzero_reports_failed_even_without_diff():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": False, "exit_code": 2},
+            "log": {"new_output": "", "raw": ""},
+            "git": {"is_clean": True, "changed_files": [], "staged_files": [], "untracked_files": []},
+        }
+    )
+
+    assert result["result_status"] == "failed"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "inspect_goal_failure"
+    assert result["monitor"]["state"] == "failed"
+    assert result["monitor"]["exit_code"] == 2
+
+
+def test_classify_goal_snapshot_exited_nonzero_with_goal_achieved_and_diff_still_failed():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": False, "exit_code": 2},
+            "log": {"new_output": "Goal achieved", "raw": "Goal achieved"},
+            "git": {"is_clean": False, "changed_files": ["a.py"], "staged_files": [], "untracked_files": []},
+        }
+    )
+
+    assert result["result_status"] == "failed"
+    assert result["next_action"] == "inspect_goal_failure"
+    assert result["candidate_evidence"]["changed_files"] == ["a.py"]
+    assert result["monitor"]["state"] == "failed"
+    assert result["monitor"]["goal_achieved_seen"] is True
+
+
+def test_classify_goal_snapshot_process_missing_preserves_candidate_evidence():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-missing",
+            "process": {"found": False},
+            "log": {"raw": ""},
+            "git": {"is_clean": False, "changed_files": [], "staged_files": [], "untracked_files": ["new.py"]},
+        }
+    )
+
+    assert result["result_status"] == "process_missing"
+    assert result["candidate_evidence"]["untracked_files"] == ["new.py"]
+
+
+def test_classify_goal_snapshot_pasted_content_in_new_output_takes_attention_path():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": True, "exit_code": None},
+            "log": {"new_output": "[Pasted Content]", "raw": "composer waiting"},
+            "git": {"is_clean": True, "changed_files": [], "staged_files": [], "untracked_files": []},
+            "wait_windows": 1,
+            "idle_windows": 1,
+        }
+    )
+
+    assert result["result_status"] == "needs_attention"
+    assert result["next_action"] == "send_raw_enter_or_ask"
+    assert result["monitor"]["state"] == "pasted_content_suspected"
+
+
+def test_classify_goal_snapshot_goal_achieved_with_diff_while_running_collects_candidate():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": True, "exit_code": None},
+            "log": {"new_output": "Goal achieved", "raw": "Goal achieved\ncomposer open"},
+            "git": {"is_clean": False, "changed_files": ["tools/example.py"], "staged_files": [], "untracked_files": []},
+            "wait_windows": 4,
+            "idle_windows": 0,
+        }
+    )
+
+    assert result["result_status"] == "completed"
+    assert result["next_action"] == "collect_candidate_for_hermes_review"
+    assert result["candidate_evidence"]["changed_files"] == ["tools/example.py"]
+    assert result["monitor"]["goal_achieved_seen"] is True
+
+
+def test_classify_goal_snapshot_goal_achieved_with_diff_overrides_historical_paste_warning():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": True, "exit_code": None},
+            "log": {"new_output": "Goal achieved", "raw": "[Pasted Content]\nwork\nGoal achieved"},
+            "git": {"is_clean": False, "changed_files": ["a.py"], "staged_files": [], "untracked_files": []},
+            "wait_windows": 4,
+            "idle_windows": 0,
+        }
+    )
+
+    assert result["result_status"] == "completed"
+    assert result["next_action"] == "collect_candidate_for_hermes_review"
+    assert result["monitor"]["state"] == "completed"
+    assert result["monitor"]["goal_achieved_seen"] is True
+
+
+def test_classify_goal_snapshot_still_running_clean_idle_returns_idle_wait():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": True, "exit_code": None},
+            "log": {"new_output": "", "raw": ""},
+            "git": {"is_clean": True, "changed_files": [], "staged_files": [], "untracked_files": []},
+            "wait_windows": 3,
+            "idle_windows": 3,
+        }
+    )
+
+    assert result["result_status"] == "idle_wait"
+    assert result["classification"] == "monitoring"
+    assert result["candidate_disposition"] == "running"
+    assert result["next_action"] == "continue_monitoring_or_inspect_tui"
+    assert result["monitor"]["state"] == "idle"
 
 
 def test_missing_goals_feature_is_reported_as_preflight_blocker(tmp_path, monkeypatch):
