@@ -1,6 +1,6 @@
 # `codex_goal_run` Slice Handoff
 
-> 状态：Slice 1-4F mock/replay/gated driver 与 real TUI smoke runbook 已实现并本地提交；真实 Codex TUI 尚未接入。
+> 状态：Slice 1-6 mock/replay/gated driver、real TUI smoke runbook、一次授权真实 TUI smoke、以及 smoke 经验回归已实现；真实 adapter 仍未接入 runtime 默认路径。
 > 日期：2026-06-16
 > 关联设计：`docs/working-notes/hermes-codex-goal-run-design.md`
 > 关联 runbook：`docs/working-notes/hermes-codex-goal-run-real-tui-smoke-runbook.md`
@@ -9,9 +9,9 @@
 ## 1. 当前边界结论
 
 ```text
-Slice 1-4F = official Codex /goal driver 的 mock-first + replay classifier + disabled/gated adapter runner 骨架 + real TUI smoke runbook。
-它证明 API、artifact、launch lifecycle、monitor state machine、process/log/git snapshot classifier、disabled adapter wrapper、gated runner interface、monitor_goal call-site 和最小真实 smoke 边界可以被 Hermes 编排。
-它没有启动真实 Codex TUI，也没有执行真实 `codex-yuna --enable goals`。
+Slice 1-6 = official Codex /goal driver 的 mock-first + replay classifier + disabled/gated adapter runner 骨架 + real TUI smoke runbook + 一次授权真实 TUI smoke + smoke 经验回归。
+它证明 API、artifact、launch lifecycle、monitor state machine、process/log/git snapshot classifier、disabled adapter wrapper、gated runner interface、monitor_goal call-site、最小真实 smoke 边界和 smoke 后硬化可以被 Hermes 编排。
+Slice 5 曾在用户明确授权下启动一次真实 Codex TUI；Slice 6 不再启动真实 TUI，只固化测试和文档。
 ```
 
 核心边界：
@@ -27,6 +27,8 @@ Slice 1-4F = official Codex /goal driver 的 mock-first + replay classifier + di
 - `_run_goal_adapter_once` 默认 disabled，只有显式 `adapter_enabled=True` 且 `allow_real_adapter=True` 才调用注入 runner；当前测试只用 fake injected runner。
 - `monitor_goal` 默认继续走旧 mock poll；只有显式 `adapter_enabled=True` 才进入 gated adapter call-site。
 - Slice 4F 只新增 runbook；它不是执行记录，不授权真实 TUI。
+- Slice 5 的真实 TUI smoke 只在 isolated worktree `/tmp/hermes-codex-goal-smoke-20260617-072947` 中产生 untracked marker candidate。
+- Slice 6 固化经验：`Goal blocked` + candidate evidence 应视为 candidate ready；`/tmp` worktree 不应让 tests 使用 `Path.cwd()` 假设 outside `/tmp`。
 - 不 push / deploy / restart / merge。
 - 不读 secret，不跑真实 provider / 真实数据 / 真实媒体。
 
@@ -42,6 +44,8 @@ Slice 1-4F = official Codex /goal driver 的 mock-first + replay classifier + di
 | Slice 4D | gated adapter runner contract | `_goal_adapter_stop_condition` / `_run_goal_adapter_once` 定义 runner gate 和 stop reason | default disabled 不调用 runner；未授权不调用 runner；授权路径只调用注入 runner；candidate ready 停止；failed/attention/process_missing 保留具体 stop reason | 不接真实 terminal/process/git runner；不启动真实 TUI；不执行真实 `codex-yuna --enable goals` |
 | Slice 4E | `monitor_goal` call-site contract | schema 暴露 `adapter_enabled` / `allow_real_adapter`；`monitor_goal` 可进入 gated adapter path | 默认仍旧 mock poll；`adapter_enabled=True` 不用 `_poll_goal_session`；未授权 blocked；授权但无 runner fail-closed | 不接真实 runner；不调用 terminal/process；不启动真实 TUI；不执行真实 `codex-yuna --enable goals` |
 | Slice 4F | real TUI smoke runbook | 写明未来 Slice 5 最小 smoke 的授权门、前置条件、stop condition、证据包、失败/成功模板 | runbook 落盘并链接；明确不执行真实 TUI；明确 `completion_trusted=false` | 不启动真实 TUI；不执行 runbook；不创建真实 worktree；不调用 terminal/process adapter |
+| Slice 5 | authorized real TUI smoke | 在 isolated worktree 启动一次真实 `codex-yuna --enable goals`，提交 one-line `/goal`，收集 bounded evidence | TUI session `proc_b89d474584b7` exit 0；产生 untracked marker；`git diff --check` 通过；source focused tests 45 passed | 不 push；不部署；不重启；不 commit；不 merge；不接 runtime 默认真实 adapter |
+| Slice 6 | smoke hardening docs + regression tests | 把 Slice 5 经验写回 classifier/tests/docs | `Goal blocked` + untracked candidate → `completed`/collect; outside tmp test 改用 monkeypatched fake `_TMP_ROOT`，避免 `/tmp` worktree 假设且不触碰固定系统路径 | 不启动真实 TUI；不删除 smoke worktree；不 push/deploy/restart |
 
 ## 3. Mode 当前状态对照
 
@@ -56,6 +60,7 @@ Slice 1-4F = official Codex /goal driver 的 mock-first + replay classifier + di
 | gated runner | `adapter_enabled` / `allow_real_adapter` / injected runners | 不适用 | status + snapshot + classification + stop_condition | always untrusted | 默认 disabled；未授权 blocked；当前无真实 runner |
 | monitor adapter call-site | `adapter_enabled` / `allow_real_adapter` | 不适用 | top-level result + nested `adapter` evidence | always untrusted | default = old mock poll；explicit adapter path still fail-closed |
 | smoke runbook | future explicit user authorization | 不适用 | execution checklist + evidence template | `completion_trusted=false` | docs-only；not an execution record |
+| real smoke evidence | explicit user authorization only | 不适用 | bounded log/process/git evidence | `completion_trusted=false` | isolated worktree only；candidate evidence, not final success |
 
 ## 4. 当前提交证据
 
@@ -68,13 +73,14 @@ a43dc5684 feat(codex): add disabled goal adapter wrappers
 f55af62e5 feat(codex): add gated goal adapter runner
 00a576d51 feat(codex): wire gated adapter call-site
 Slice 4F docs commit: docs(codex): add goal TUI smoke runbook
+Slice 6 commit: test/docs(codex): harden goal TUI smoke learnings
 ```
 
 测试证据来自最近实现收口：
 
 ```text
 python3 -m pytest tests/tools/test_codex_goal_run_tool.py -q -o addopts=''
-45 passed
+46 passed
 
 python3 -m py_compile tools/codex_goal_run_tool.py tests/tools/test_codex_goal_run_tool.py
 py_compile_exit_0
@@ -167,6 +173,8 @@ Slice 4A/4B/4C/4D/4E/4F 已完成：把真实 adapter 的输入/输出契约设�
 | monitor unauthorized adapter | `adapter_enabled=True`, `allow_real_adapter=False` | 不 poll，不跑 runner，返回 `real_adapter_not_authorized` |
 | monitor authorized without runner | `adapter_enabled=True`, `allow_real_adapter=True`, no runner | 不 poll，返回 `real_adapter_runner_missing` |
 | smoke runbook | future explicit authorization only | 当前不执行；只定义 runbook |
+| real smoke `Goal blocked` | `Goal blocked (/goal resume)` + untracked candidate | 不是失败；视作 candidate ready for Hermes review |
+| `/tmp` smoke worktree | tests run with `Path.cwd()` under `/tmp` | tests 不应把 `Path.cwd()` 当 outside `/tmp`；outside tmp 用 monkeypatched fake `_TMP_ROOT` |
 
 ### 5.5 Slice 4 明确非目标
 
@@ -177,7 +185,28 @@ Slice 4A/4B/4C/4D/4E/4F 已完成：把真实 adapter 的输入/输出契约设�
 - 不自动 commit/push/deploy/restart。
 - 不把 raw TUI log 全量写入模型上下文。
 
-## 6. Slice 4 之后才考虑 Slice 5
+## 6. Slice 5/6 真实 smoke 与硬化结论
+
+2026-06-17 授权 smoke 结果：
+
+```text
+worktree: /tmp/hermes-codex-goal-smoke-20260617-072947
+branch: codex-goal-smoke-20260617-072947
+session: proc_b89d474584b7
+exit_code: 0
+candidate: docs/working-notes/hermes-codex-goal-tui-smoke-marker-20260617-072947.md
+classification: candidate evidence only; completion_trusted=false
+```
+
+学到的 runtime contract：
+
+- TUI can emit high-volume output; Hermes process containment kept context-safe summary.
+- `Goal blocked (/goal resume)` plus candidate evidence means Codex is waiting for Hermes review, not a task failure.
+- untracked-only candidate is valid evidence and must not be dropped.
+- smoke worktree may live under `/tmp`; tests must not assume `Path.cwd()` is outside `/tmp`.
+- `/quit` + raw Enter can close the idle/blocked TUI session.
+
+## 7. Slice 4 之后才考虑 Slice 5
 
 Slice 5 才是 behind explicit authorization 的真实 TUI smoke：
 
@@ -200,12 +229,12 @@ Slice 5 之前必须先有：
 - raw log bounded tail 规则。
 - candidate diff/staged/untracked evidence contract。
 
-## 7. 下一步执行建议
+## 8. 下一步执行建议
 
 推荐下一步仍然不进真实 TUI：
 
 ```text
-Slice 5：只有用户单独授权后，才按 runbook 做真实 TUI smoke。
+Slice 7：设计/实现 bounded candidate review packet for TUI Goal evidence。
 ```
 
-不要直接进入真实 TUI。
+不要重复真实 TUI smoke，除非用户重新明确授权。

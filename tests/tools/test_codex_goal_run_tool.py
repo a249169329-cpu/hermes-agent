@@ -199,7 +199,9 @@ def test_prepare_goal_rejects_artifact_dir_inside_repo(tmp_path, monkeypatch):
 
 def test_prepare_goal_rejects_artifact_dir_outside_tmp(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
-    artifact_dir = Path.cwd() / "codex-goal-should-not-be-created"
+    fake_tmp_root = tmp_path / "allowed-tmp-root"
+    artifact_dir = tmp_path / "outside-fake-tmp-root" / "codex-goal-should-not-be-created"
+    monkeypatch.setattr(tool, "_TMP_ROOT", fake_tmp_root.resolve())
     monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
 
     result = _call(repo, mode="prepare_goal", goal_artifact_dir=str(artifact_dir))
@@ -754,6 +756,43 @@ def test_classify_goal_snapshot_goal_achieved_with_diff_while_running_collects_c
     assert result["next_action"] == "collect_candidate_for_hermes_review"
     assert result["candidate_evidence"]["changed_files"] == ["tools/example.py"]
     assert result["monitor"]["goal_achieved_seen"] is True
+
+
+def test_classify_goal_snapshot_goal_blocked_with_untracked_candidate_collects_for_review():
+    result = tool._classify_goal_snapshot(
+        {
+            "session_id": "session-1",
+            "process": {"found": True, "still_running": True, "exit_code": None},
+            "log": {
+                "new_output": "Goal blocked (/goal resume)",
+                "raw": "candidate diff ready\nwaiting for Hermes review\nGoal blocked (/goal resume)",
+            },
+            "git": {
+                "is_clean": False,
+                "changed_files": [],
+                "staged_files": [],
+                "untracked_files": ["docs/working-notes/smoke-marker.md"],
+                "diff_stat": "",
+                "staged_diff_stat": "",
+            },
+            "wait_windows": 3,
+            "idle_windows": 0,
+        }
+    )
+
+    assert result["result_status"] == "completed"
+    assert result["classification"] == "monitoring"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "collect_candidate_for_hermes_review"
+    assert result["completion_trusted"] is False
+    assert result["monitor"]["state"] == "completed"
+    assert result["monitor"]["goal_blocked_seen"] is True
+    assert result["candidate_evidence"]["untracked_files"] == ["docs/working-notes/smoke-marker.md"]
+    assert tool._goal_adapter_stop_condition(result) == {
+        "should_stop": True,
+        "reason": "candidate_ready_for_review",
+        "completion_trusted": False,
+    }
 
 
 def test_classify_goal_snapshot_goal_achieved_with_diff_overrides_historical_paste_warning():

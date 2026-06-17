@@ -250,3 +250,32 @@ Codex 结果仅为 candidate evidence，仍需 Hermes review。
 - 工作区最终 clean。
 
 明确不要求、也不允许真实 TUI smoke。
+
+## 11. Slice 5/6 真实 smoke 观察与回归
+
+2026-06-17 用户单独授权后，执行过一次最小真实 TUI smoke：
+
+```text
+worktree_path: /tmp/hermes-codex-goal-smoke-20260617-072947
+branch: codex-goal-smoke-20260617-072947
+session_id: proc_b89d474584b7
+TUI exit_code: 0
+candidate: docs/working-notes/hermes-codex-goal-tui-smoke-marker-20260617-072947.md
+source focused tests: 45 passed after smoke
+completion_trusted=false
+```
+
+观察：
+
+- `Goal blocked (/goal resume)` + candidate evidence 表示 Codex 已停在“等待 Hermes review”，不是失败。
+- untracked-only candidate 是有效 evidence，不能被 `git diff` 空输出误判为无变更。
+- TUI 输出可能很大；Hermes process containment 能返回 context-safe summary，raw log 只按需读取 bounded tail。
+- smoke worktree 可能位于 `/tmp`；测试不能用 `Path.cwd()` 伪造 outside `/tmp` 路径。
+- `/quit` 后补 raw Enter 可以关闭 idle/blocked TUI session。
+
+Slice 6 已把上述经验固化为：
+
+- classifier regression：`Goal blocked` + untracked candidate → `completed` / `collect_candidate_for_hermes_review` / `completion_trusted=false`。
+- test hardening：outside tmp artifact rejection 使用 monkeypatched fake `_TMP_ROOT`，不再依赖当前工作目录位置，也不触碰固定系统路径。
+
+重复真实 TUI smoke 仍需新的用户明确授权。

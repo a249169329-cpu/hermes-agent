@@ -1,6 +1,6 @@
 # `codex_goal_run` Runtime Driver Design
 
-> 状态：设计文档 / implementation plan；Slice 1-4F mock-first/replay/gated runtime skeleton 与 real TUI smoke runbook 已实现，真实 TUI 尚未接入。
+> 状态：设计文档 / implementation plan；Slice 1-6 mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、以及 smoke hardening 已实现；真实 adapter 仍未接入 runtime 默认路径。
 > 日期：2026-06-16
 > 关联文档：
 > - `docs/working-notes/hermes-codex-division-of-labor.md`
@@ -24,6 +24,8 @@
 | Slice 4D | `f55af62e5 feat(codex): add gated goal adapter runner` | `_goal_adapter_stop_condition` / `_run_goal_adapter_once` gated runner interface，默认 disabled | 否 |
 | Slice 4E | `00a576d51 feat(codex): wire gated adapter call-site` | `monitor_goal` adapter call-site；schema 暴露 `adapter_enabled` / `allow_real_adapter`；默认旧 mock poll | 否 |
 | Slice 4F | `docs(codex): add goal TUI smoke runbook` | 最小真实 TUI smoke runbook：授权门、前置检查、stop condition、证据包、失败/成功模板 | 否 |
+| Slice 5 | authorized real TUI smoke | 在 isolated `/tmp` worktree 启动一次 `codex-yuna --enable goals`；产出 untracked marker candidate；TUI exit 0 | 是，仅一次授权 smoke |
+| Slice 6 | `test/docs(codex): harden goal TUI smoke learnings` | 固化 smoke 经验：`Goal blocked` + candidate evidence => candidate ready；测试通过 monkeypatched `_TMP_ROOT` 不再假设 `Path.cwd()` outside `/tmp` | 否 |
 
 详细对照表与 Slice 4 边界计划见：
 
@@ -685,8 +687,10 @@ git diff --check HEAD
 - `monitor_goal` adapter path 不走 `_poll_goal_session`，未授权/无 runner 都 fail-closed；
 - runbook 明确没有用户单独授权前不得启动真实 TUI；
 - runbook 明确 smoke 成功也只能产生 candidate evidence，`completion_trusted=false`。
+- authorized smoke observed `Goal blocked (/goal resume)` with untracked-only candidate; classifier treats that as `completed` + `collect_candidate_for_hermes_review`, still untrusted.
+- tests use a monkeypatched fake `_TMP_ROOT` for artifact rejection so `/tmp` smoke worktrees do not invalidate the suite and no fixed system path is touched.
 
-### Slice 5：review handoff integration
+### Slice 7（后续）：review handoff integration
 
 功能：
 
@@ -743,22 +747,22 @@ git diff --check HEAD
 
 ## 19. 下一步建议
 
-若继续进入实现，下一步已经越过 Slice 4：**Slice 5：真实 TUI smoke，只能在用户单独授权后执行**。
+若继续进入实现，下一步建议是 **Slice 7：bounded candidate review packet for TUI Goal evidence**，默认不再跑真实 TUI。
 
 理由：
 
 ```text
-Slice 1-4F 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton 和 smoke runbook。
-下一步不是继续 mock 设计，而是等待用户单独授权 Slice 5。
-没有明确授权时，只能继续审查/修订 runbook，不能启动真实 TUI。
+Slice 1-6 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke 和 smoke hardening。
+下一步应把 TUI Goal candidate evidence 打成 bounded review packet，供 Hermes/Codex review 使用。
+默认不再启动真实 TUI；只有用户重新明确授权时才重跑 smoke。
 ```
 
 下一阶段应停止在：
 
 ```text
-explicit user authorization for Slice 5
-one minimal TUI smoke only
-Hermes review after candidate evidence
+bounded review packet for TUI Goal evidence
+include staged/unstaged/untracked candidate files
+do not repeat real TUI smoke
 ```
 
 不要直接做真实 `launch_goal` / `codex-yuna --enable goals`。

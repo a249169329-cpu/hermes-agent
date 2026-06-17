@@ -516,6 +516,7 @@ def _classify_goal_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     log_tail = _bounded_log_tail(raw_log, max_lines=40, max_chars=4000)
     combined_log = f"{raw_log}\n{new_output}".lower()
     goal_achieved_seen = "goal achieved" in combined_log
+    goal_blocked_seen = "goal blocked" in combined_log
     pasted_content_suspected = "[pasted content]" in combined_log
     wait_windows = snapshot.get("wait_windows")
     idle_windows = snapshot.get("idle_windows")
@@ -577,6 +578,17 @@ def _classify_goal_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             "next_action": "collect_candidate_for_hermes_review",
             "completion_trusted": False,
             "monitor": monitor("completed", goal_achieved_seen=True, exit_code=exit_code),
+            "candidate_evidence": candidate_evidence,
+        }
+
+    if goal_blocked_seen and has_candidate_evidence:
+        return {
+            "result_status": "completed",
+            "classification": "monitoring",
+            "candidate_disposition": "needs_review",
+            "next_action": "collect_candidate_for_hermes_review",
+            "completion_trusted": False,
+            "monitor": monitor("completed", goal_blocked_seen=True, exit_code=exit_code),
             "candidate_evidence": candidate_evidence,
         }
 
