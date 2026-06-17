@@ -1,7 +1,7 @@
 # `codex_goal_run` Runtime Driver Design
 
-> 状态：设计文档 / implementation plan；Slice 1-6 mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、以及 smoke hardening 已实现；真实 adapter 仍未接入 runtime 默认路径。
-> 日期：2026-06-16
+> 状态：设计文档 / implementation plan；Slice 1-7A mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、smoke hardening、以及 `collect_candidate` review handoff 已实现；真实 adapter 仍未接入 runtime 默认路径。
+> 日期：2026-06-17
 > 关联文档：
 > - `docs/working-notes/hermes-codex-division-of-labor.md`
 > - `docs/working-notes/hermes-codex-driver-selection-guarded-vs-goal.md`
@@ -12,7 +12,7 @@
 
 ## 0. 当前实现快照
 
-截至 2026-06-16，本设计已分四片落地 mock-first/replay 骨架：
+截至 2026-06-17，本设计已分片落地 mock-first/replay 骨架：
 
 | Slice | commit | 覆盖范围 | 真实 TUI |
 |---|---|---|---|
@@ -26,6 +26,7 @@
 | Slice 4F | `docs(codex): add goal TUI smoke runbook` | 最小真实 TUI smoke runbook：授权门、前置检查、stop condition、证据包、失败/成功模板 | 否 |
 | Slice 5 | authorized real TUI smoke | 在 isolated `/tmp` worktree 启动一次 `codex-yuna --enable goals`；产出 untracked marker candidate；TUI exit 0 | 是，仅一次授权 smoke |
 | Slice 6 | `test/docs(codex): harden goal TUI smoke learnings` | 固化 smoke 经验：`Goal blocked` + candidate evidence => candidate ready；测试通过 monkeypatched `_TMP_ROOT` 不再假设 `Path.cwd()` outside `/tmp` | 否 |
+| Slice 7A | `collect_candidate` review handoff | dirty candidate worktree 可收集 tracked/staged/untracked/diff_stat/status evidence；生成 bounded `review_handoff.review_packet` | 否 |
 
 详细对照表与 Slice 4 边界计划见：
 
@@ -39,6 +40,7 @@ docs/working-notes/hermes-codex-goal-run-slice-handoff.md
 不启动真实 Codex TUI。
 不执行真实 `codex-yuna --enable goals`。
 不调用 terminal/process tool 作为 monitor adapter。
+不执行 review guard / review packet runner。
 不 push / deploy / restart。
 ```
 
@@ -494,6 +496,17 @@ process exit code / still running
 git diff 不显示 untracked，新文件必须额外列出。
 ```
 
+Slice 7A 已落地的 `collect_candidate` mode：
+
+```text
+dirty candidate worktree allowed
+Codex goals preflight not run
+candidate_evidence.changed_files / staged_files / untracked_files collected via git
+diff_stat / staged_diff_stat / status_short bounded by tool output limiter
+review_handoff.review_packet carries stage_id/objective/scope/required_verification/candidate_evidence
+completion_trusted=false
+```
+
 如果发现 unexpected untracked/staged files：
 
 ```text
@@ -690,11 +703,29 @@ git diff --check HEAD
 - authorized smoke observed `Goal blocked (/goal resume)` with untracked-only candidate; classifier treats that as `completed` + `collect_candidate_for_hermes_review`, still untrusted.
 - tests use a monkeypatched fake `_TMP_ROOT` for artifact rejection so `/tmp` smoke worktrees do not invalidate the suite and no fixed system path is touched.
 
-### Slice 7（后续）：review handoff integration
+### Slice 7A：collect_candidate review handoff（已实现）
 
 功能：
 
-- 生成 bounded review packet 输入；
+- 新增 `collect_candidate` mode；
+- dirty candidate worktree 不走 `dirty_worktree` blocker，而是作为 candidate evidence；
+- 收集 unstaged tracked、staged、untracked、diff_stat、staged_diff_stat、status_short；
+- 生成 bounded `review_handoff.review_packet`，供 Hermes 后续 review/verification 使用；
+- clean repo 返回 `no_candidate_changes`，不假装成功。
+
+测试：
+
+- schema enum 暴露 `collect_candidate`；
+- dirty repo 同时包含 tracked/staged/untracked 时返回 `candidate_ready_for_review`；
+- clean repo 返回 `no_candidate_changes`；
+- `collect_candidate` 不触发 Codex preflight、TUI launch、TUI poll hooks；
+- `completion_trusted=false`。
+
+### Slice 7B（后续）：review runner integration
+
+功能：
+
+- 将 Slice 7A 的 bounded review packet 接到后续 review lane；
 - staged/unstaged/untracked 包含完整；
 - review unavailable 不算 pass。
 
@@ -747,21 +778,21 @@ git diff --check HEAD
 
 ## 19. 下一步建议
 
-若继续进入实现，下一步建议是 **Slice 7：bounded candidate review packet for TUI Goal evidence**，默认不再跑真实 TUI。
+若继续进入实现，下一步建议是 **Slice 7B：review runner integration for collect_candidate packet**，默认不再跑真实 TUI。
 
 理由：
 
 ```text
-Slice 1-6 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke 和 smoke hardening。
-下一步应把 TUI Goal candidate evidence 打成 bounded review packet，供 Hermes/Codex review 使用。
+Slice 1-7A 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke、smoke hardening 和 collect_candidate review handoff。
+下一步才考虑把 collect_candidate packet 接到 Hermes/Codex review runner。
 默认不再启动真实 TUI；只有用户重新明确授权时才重跑 smoke。
 ```
 
 下一阶段应停止在：
 
 ```text
-bounded review packet for TUI Goal evidence
-include staged/unstaged/untracked candidate files
+review runner integration for collect_candidate packet
+keep staged/unstaged/untracked candidate files in packet
 do not repeat real TUI smoke
 ```
 

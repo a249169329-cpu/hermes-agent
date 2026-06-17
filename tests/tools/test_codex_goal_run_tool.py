@@ -81,7 +81,7 @@ def test_schema_registration_and_toolset_exposure():
         "mode",
         "dirty_baseline_policy",
     ]
-    assert props["mode"]["enum"] == ["dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal"]
+    assert props["mode"]["enum"] == ["dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal", "collect_candidate"]
     assert props["standing_authorization"]["type"] == "boolean"
     assert "codex_goal_run" in toolsets._HERMES_CORE_TOOLS
     assert toolsets.TOOLSETS["codex_goal_run"]["tools"] == ["codex_goal_run"]
@@ -93,6 +93,85 @@ def test_schema_exposes_monitor_adapter_gating_fields():
 
     assert props["adapter_enabled"]["type"] == "boolean"
     assert props["allow_real_adapter"]["type"] == "boolean"
+
+
+def test_collect_candidate_allows_dirty_repo_and_builds_review_handoff(tmp_path):
+    repo = _clean_repo(tmp_path)
+    (repo / "README.md").write_text("hello\ntracked change\n", encoding="utf-8")
+    staged = repo / "staged.py"
+    staged.write_text("print('staged')\n", encoding="utf-8")
+    _git(repo, "add", "staged.py")
+    untracked = repo / "notes.md"
+    untracked.write_text("untracked candidate note\n", encoding="utf-8")
+
+    result = _call(
+        repo,
+        mode="collect_candidate",
+        stage_id="slice-7a",
+        objective="Collect Goal candidate evidence for Hermes review",
+        allowed_files=["tools/codex_goal_run_tool.py"],
+        allowed_globs=["tests/tools/test_codex_goal_run_tool.py"],
+        required_verification=["python3 -m pytest tests/tools/test_codex_goal_run_tool.py -q -o addopts=''"],
+    )
+
+    assert result["status"] == "candidate_ready_for_review"
+    assert result["classification"] == "review_handoff"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "run_hermes_review_on_candidate_packet"
+    assert result["completion_trusted"] is False
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "collect_candidate_only"}
+    assert result["preflight"]["dirty_check"]["is_clean"] is False
+
+    evidence = result["candidate_evidence"]
+    assert evidence["changed_files"] == ["README.md"]
+    assert evidence["staged_files"] == ["staged.py"]
+    assert evidence["untracked_files"] == ["notes.md"]
+    assert "README.md" in evidence["diff_stat"]
+    assert "staged.py" in evidence["staged_diff_stat"]
+
+    handoff = result["review_handoff"]
+    assert handoff["status"] == "candidate_ready_for_review"
+    assert handoff["completion_trusted"] is False
+    assert handoff["raw_log_included"] is False
+    assert handoff["review_packet"]["stage_id"] == "slice-7a"
+    assert handoff["review_packet"]["objective"] == "Collect Goal candidate evidence for Hermes review"
+    assert handoff["review_packet"]["candidate_evidence"] == evidence
+    assert "inspect_changed_staged_and_untracked_files" in handoff["review_packet"]["review_guidance"]
+    assert "python3 -m pytest tests/tools/test_codex_goal_run_tool.py -q -o addopts=''" in handoff["review_packet"]["required_verification"]
+
+
+def test_collect_candidate_clean_repo_reports_no_candidate_changes(tmp_path):
+    repo = _clean_repo(tmp_path)
+
+    result = _call(repo, mode="collect_candidate", stage_id="slice-7a")
+
+    assert result["status"] == "no_candidate_changes"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "planning_only"
+    assert result["next_action"] == "inspect_no_candidate_changes"
+    assert result["completion_trusted"] is False
+    assert result["candidate_evidence"]["changed_files"] == []
+    assert result["candidate_evidence"]["staged_files"] == []
+    assert result["candidate_evidence"]["untracked_files"] == []
+    assert result["review_handoff"]["status"] == "no_candidate_changes"
+
+
+def test_collect_candidate_does_not_run_codex_preflight_or_tui_hooks(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    def forbidden_hook(*args, **kwargs):
+        raise AssertionError("collect_candidate must not run Codex preflight, launch TUI, or poll TUI session")
+
+    monkeypatch.setattr(tool, "_codex_goals_preflight", forbidden_hook)
+    monkeypatch.setattr(tool, "_launch_goal_tui", forbidden_hook, raising=False)
+    monkeypatch.setattr(tool, "_poll_goal_session", forbidden_hook, raising=False)
+
+    result = _call(repo, mode="collect_candidate", stage_id="slice-7a")
+
+    assert result["status"] == "candidate_ready_for_review"
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "collect_candidate_only"}
+    assert result["candidate_evidence"]["untracked_files"] == ["candidate.md"]
 
 
 def test_codex_goals_preflight_uses_features_list(monkeypatch):
@@ -241,6 +320,7 @@ def test_monitor_goal_mode_is_schema_exposed():
         "prepare_goal",
         "launch_goal",
         "monitor_goal",
+        "collect_candidate",
     ]
 
 

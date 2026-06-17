@@ -8,7 +8,7 @@ from typing import Any
 from tools.registry import registry
 
 
-_SUPPORTED_MODES = {"dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal"}
+_SUPPORTED_MODES = {"dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal", "collect_candidate"}
 _SUPPORTED_DIRTY_POLICY = "require-clean"
 _DRIVER = "codex_tui_goal"
 _DEFAULT_ARTIFACT_ROOT = Path("/tmp/hermes-codex-goals")
@@ -89,6 +89,87 @@ def _dirty_check(repo: Path) -> dict[str, Any]:
         "dirty_paths": paths[:_DIRTY_PATH_LIMIT],
         "dirty_paths_truncated": len(paths) > _DIRTY_PATH_LIMIT,
         "dirty_state_id": digest,
+    }
+
+
+def _git_stdout_lines(proc: subprocess.CompletedProcess) -> list[str]:
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _collect_candidate_git_evidence(repo: Path) -> dict[str, Any]:
+    changed_proc = _git(repo, "diff", "--name-only")
+    staged_proc = _git(repo, "diff", "--cached", "--name-only")
+    untracked_proc = _git(repo, "ls-files", "--others", "--exclude-standard")
+    diff_stat_proc = _git(repo, "diff", "--stat")
+    staged_diff_stat_proc = _git(repo, "diff", "--cached", "--stat")
+    status_proc = _git(repo, "status", "--short", "--branch", "--untracked-files=all")
+    errors = []
+    for label, proc in [
+        ("changed_files", changed_proc),
+        ("staged_files", staged_proc),
+        ("untracked_files", untracked_proc),
+        ("diff_stat", diff_stat_proc),
+        ("staged_diff_stat", staged_diff_stat_proc),
+        ("status_short", status_proc),
+    ]:
+        if proc.returncode != 0:
+            errors.append({"source": label, "stderr": proc.stderr.strip()})
+
+    changed_files = _git_stdout_lines(changed_proc)
+    staged_files = _git_stdout_lines(staged_proc)
+    untracked_files = _git_stdout_lines(untracked_proc)
+    return {
+        "repo": str(repo),
+        "is_clean": not (changed_files or staged_files or untracked_files),
+        "changed_files": changed_files,
+        "staged_files": staged_files,
+        "untracked_files": untracked_files,
+        "diff_stat": diff_stat_proc.stdout.strip() if diff_stat_proc.returncode == 0 else "",
+        "staged_diff_stat": staged_diff_stat_proc.stdout.strip() if staged_diff_stat_proc.returncode == 0 else "",
+        "status_short": status_proc.stdout.strip() if status_proc.returncode == 0 else "",
+        "errors": errors,
+    }
+
+
+def _build_candidate_review_handoff(
+    *,
+    repo: Path,
+    args: dict[str, Any],
+    git_head: str | None,
+    dirty: dict[str, Any],
+    candidate_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    has_candidate_changes = bool(
+        candidate_evidence.get("changed_files")
+        or candidate_evidence.get("staged_files")
+        or candidate_evidence.get("untracked_files")
+    )
+    status = "candidate_ready_for_review" if has_candidate_changes else "no_candidate_changes"
+    return {
+        "status": status,
+        "completion_trusted": False,
+        "raw_log_included": False,
+        "review_packet": {
+            "driver": _DRIVER,
+            "stage_id": args.get("stage_id"),
+            "workdir": str(repo),
+            "git_head": git_head,
+            "objective": args.get("objective"),
+            "scope": {
+                "allowed_files": _string_list(args.get("allowed_files")),
+                "allowed_globs": _string_list(args.get("allowed_globs")),
+            },
+            "required_verification": _string_list(args.get("required_verification")),
+            "candidate_evidence": candidate_evidence,
+            "dirty_check": dirty,
+            "review_guidance": [
+                "inspect_changed_staged_and_untracked_files",
+                "run_required_verification_before_success_claim",
+                "treat_codex_goal_output_as_untrusted_candidate_evidence",
+            ],
+        },
     }
 
 
@@ -905,9 +986,9 @@ def codex_goal_run(args: dict[str, Any]) -> str:
                 stage_id=args.get("stage_id"),
                 preflight={"status": "not_run", "blockers": ["unsupported_mode"]},
                 classification="rejected",
-                next_action="use_dry_run_plan_prepare_goal_launch_goal_or_monitor_goal",
+                next_action="use_dry_run_plan_prepare_goal_launch_goal_monitor_goal_or_collect_candidate",
                 candidate_disposition="planning_only",
-                reason="Supported modes are dry_run_plan, prepare_goal, launch_goal, and monitor_goal.",
+                reason="Supported modes are dry_run_plan, prepare_goal, launch_goal, monitor_goal, and collect_candidate.",
             )
         )
 
@@ -1046,6 +1127,44 @@ def codex_goal_run(args: dict[str, Any]) -> str:
                 git_head=git_head,
                 plan=plan,
                 monitor=monitor_result["monitor"],
+            )
+        )
+
+    if mode == "collect_candidate":
+        candidate_evidence = _collect_candidate_git_evidence(repo)
+        has_candidate_changes = bool(
+            candidate_evidence.get("changed_files")
+            or candidate_evidence.get("staged_files")
+            or candidate_evidence.get("untracked_files")
+        )
+        review_handoff = _build_candidate_review_handoff(
+            repo=repo,
+            args=args,
+            git_head=git_head,
+            dirty=dirty,
+            candidate_evidence=candidate_evidence,
+        )
+        status = "candidate_ready_for_review" if has_candidate_changes else "no_candidate_changes"
+        return _json_result(
+            _base_result(
+                status=status,
+                mode=mode,
+                workdir=repo,
+                stage_id=args.get("stage_id"),
+                preflight={
+                    "status": "collecting" if has_candidate_changes else "no_candidate_changes",
+                    "blockers": [] if has_candidate_changes else ["no_candidate_changes"],
+                    "dirty_check": dirty,
+                    "codex": {"status": "not_run", "reason": "collect_candidate_only"},
+                },
+                classification="review_handoff" if has_candidate_changes else "blocked",
+                next_action="run_hermes_review_on_candidate_packet" if has_candidate_changes else "inspect_no_candidate_changes",
+                candidate_disposition="needs_review" if has_candidate_changes else "planning_only",
+                dirty_baseline_policy=dirty_policy,
+                git_head=git_head,
+                plan=plan,
+                candidate_evidence=candidate_evidence,
+                review_handoff=review_handoff,
             )
         )
 
@@ -1232,7 +1351,7 @@ _SCHEMA = {
             "non_goals": {"type": "array", "items": {"type": "string"}},
             "required_verification": {"type": "array", "items": {"type": "string"}},
             "stop_conditions": {"type": "array", "items": {"type": "string"}},
-            "mode": {"type": "string", "enum": ["dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal"]},
+            "mode": {"type": "string", "enum": ["dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal", "collect_candidate"]},
             "dirty_baseline_policy": {"type": "string", "enum": ["require-clean"]},
             "allow_isolated_worktree": {"type": "boolean"},
             "goal_artifact_dir": {"type": "string"},
