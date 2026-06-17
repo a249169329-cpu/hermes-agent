@@ -1,11 +1,12 @@
 # `codex_goal_run` Runtime Driver Design
 
-> 状态：设计文档 / implementation plan；Slice 1-4E mock-first/replay/gated runtime skeleton 已实现，真实 TUI 尚未接入。
+> 状态：设计文档 / implementation plan；Slice 1-4F mock-first/replay/gated runtime skeleton 与 real TUI smoke runbook 已实现，真实 TUI 尚未接入。
 > 日期：2026-06-16
 > 关联文档：
 > - `docs/working-notes/hermes-codex-division-of-labor.md`
 > - `docs/working-notes/hermes-codex-driver-selection-guarded-vs-goal.md`
 > - `docs/working-notes/hermes-codex-goal-run-slice-handoff.md`
+> - `docs/working-notes/hermes-codex-goal-run-real-tui-smoke-runbook.md`
 > - skill：`autonomous-ai-agents/codex-goal-stage-workflow`
 > - skill reference：`codex` / `references/official-goal-mode-codex-cli.md`（通过 `skill_view` 读取，不是 repo 内文件）
 
@@ -22,6 +23,7 @@
 | Slice 4C | `a43dc5684 feat(codex): add disabled goal adapter wrappers` | `_collect_goal_process_snapshot` / `_collect_goal_git_evidence` / `_compose_goal_snapshot` disabled/replay wrappers | 否 |
 | Slice 4D | `f55af62e5 feat(codex): add gated goal adapter runner` | `_goal_adapter_stop_condition` / `_run_goal_adapter_once` gated runner interface，默认 disabled | 否 |
 | Slice 4E | `00a576d51 feat(codex): wire gated adapter call-site` | `monitor_goal` adapter call-site；schema 暴露 `adapter_enabled` / `allow_real_adapter`；默认旧 mock poll | 否 |
+| Slice 4F | `docs(codex): add goal TUI smoke runbook` | 最小真实 TUI smoke runbook：授权门、前置检查、stop condition、证据包、失败/成功模板 | 否 |
 
 详细对照表与 Slice 4 边界计划见：
 
@@ -649,7 +651,7 @@ git diff --check HEAD
 - process exited with diff；
 - untracked files included。
 
-### Slice 4：real adapter contract / replay classifier，不接真实 TUI（4A/4B/4C/4D/4E 已实现）
+### Slice 4：real adapter contract / replay classifier，不接真实 TUI（4A/4B/4C/4D/4E/4F 已实现）
 
 功能：
 
@@ -659,6 +661,7 @@ git diff --check HEAD
 - 新增默认 disabled/replay-only adapter wrappers：`_collect_goal_process_snapshot` / `_collect_goal_git_evidence` / `_compose_goal_snapshot`；（已完成）
 - 新增 gated runner interface 和 stop condition：`_run_goal_adapter_once` / `_goal_adapter_stop_condition`；（已完成）
 - 新增 `monitor_goal` call-site：默认旧 mock poll，显式 `adapter_enabled=True` 才进入 gated adapter path；（已完成）
+- 新增最小真实 TUI smoke runbook：授权门、证据包、stop condition、失败/成功模板；（已完成，未执行）
 - 默认仍 disabled/mock-only，不调用真实 terminal/process，不启动 `codex-yuna --enable goals`。
 
 测试：
@@ -679,7 +682,9 @@ git diff --check HEAD
 - failed / needs_attention / process_missing stop reason 不被泛化成 blocked；
 - schema 暴露 `adapter_enabled` / `allow_real_adapter`；
 - `monitor_goal` 默认路径仍走 `_poll_goal_session` mock；
-- `monitor_goal` adapter path 不走 `_poll_goal_session`，未授权/无 runner 都 fail-closed。
+- `monitor_goal` adapter path 不走 `_poll_goal_session`，未授权/无 runner 都 fail-closed；
+- runbook 明确没有用户单独授权前不得启动真实 TUI；
+- runbook 明确 smoke 成功也只能产生 candidate evidence，`completion_trusted=false`。
 
 ### Slice 5：review handoff integration
 
@@ -738,22 +743,22 @@ git diff --check HEAD
 
 ## 19. 下一步建议
 
-若继续进入实现，建议先做 **Slice 4F：最小真实 TUI smoke runbook（只写 runbook，不执行）**。
+若继续进入实现，下一步已经越过 Slice 4：**Slice 5：真实 TUI smoke，只能在用户单独授权后执行**。
 
 理由：
 
 ```text
-Slice 1-4E 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton。
-下一步应写最小真实 TUI smoke runbook，明确授权、stop condition、证据和回滚，但不执行。
-等 runbook 被审查后，再由用户单独授权真实 TUI smoke。
+Slice 1-4F 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton 和 smoke runbook。
+下一步不是继续 mock 设计，而是等待用户单独授权 Slice 5。
+没有明确授权时，只能继续审查/修订 runbook，不能启动真实 TUI。
 ```
 
 下一阶段应停止在：
 
 ```text
-minimal real TUI smoke runbook
-authorization / stop condition / evidence checklist
-no real TUI execution
+explicit user authorization for Slice 5
+one minimal TUI smoke only
+Hermes review after candidate evidence
 ```
 
 不要直接做真实 `launch_goal` / `codex-yuna --enable goals`。
