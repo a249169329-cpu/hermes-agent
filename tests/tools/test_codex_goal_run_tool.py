@@ -657,6 +657,94 @@ def test_classify_goal_snapshot_still_running_clean_idle_returns_idle_wait():
     assert result["monitor"]["state"] == "idle"
 
 
+@pytest.mark.xfail(reason="Slice 4C pending: disabled adapter wrappers are not implemented yet", strict=True)
+def test_goal_snapshot_default_adapters_are_disabled_and_side_effect_free(tmp_path):
+    missing_repo = tmp_path / "does-not-exist"
+
+    snapshot = tool._compose_goal_snapshot(session_id="session-1", repo=missing_repo, wait_seconds=7)
+
+    assert snapshot["session_id"] == "session-1"
+    assert snapshot["wait_seconds"] == 7
+    assert snapshot["adapter_status"] == {"process": "disabled", "git": "disabled"}
+    assert snapshot["process"] == {"found": False, "still_running": False, "exit_code": None}
+    assert snapshot["log"] == {"new_output": "", "raw": ""}
+    assert snapshot["git"]["repo"] == str(missing_repo)
+    assert snapshot["git"]["changed_files"] == []
+    assert snapshot["git"]["staged_files"] == []
+    assert snapshot["git"]["untracked_files"] == []
+    assert snapshot["git"]["diff_stat"] == ""
+    assert snapshot["git"]["staged_diff_stat"] == ""
+    classified = tool._classify_goal_snapshot(snapshot)
+    assert classified["result_status"] == "process_missing"
+
+
+@pytest.mark.xfail(reason="Slice 4C pending: process replay adapter contract is not implemented yet", strict=True)
+def test_collect_goal_process_snapshot_replay_normalizes_process_and_log():
+    snapshot = tool._collect_goal_process_snapshot(
+        session_id="session-1",
+        wait_seconds=3,
+        replay_snapshot={
+            "process": {"found": True, "still_running": True, "exit_code": None},
+            "log": {"new_output": "working", "raw": "thinking\nworking"},
+        },
+    )
+
+    assert snapshot["adapter_status"] == "replay"
+    assert snapshot["session_id"] == "session-1"
+    assert snapshot["wait_seconds"] == 3
+    assert snapshot["process"] == {"found": True, "still_running": True, "exit_code": None}
+    assert snapshot["log"] == {"new_output": "working", "raw": "thinking\nworking"}
+
+
+@pytest.mark.xfail(reason="Slice 4C pending: git replay adapter contract is not implemented yet", strict=True)
+def test_collect_goal_git_evidence_replay_preserves_untracked_and_diff_stats(tmp_path):
+    repo = tmp_path / "repo"
+    replay = {
+        "is_clean": False,
+        "changed_files": ["changed.py"],
+        "staged_files": ["staged.py"],
+        "untracked_files": ["new.py"],
+        "diff_stat": "changed.py | 2 ++",
+        "staged_diff_stat": "staged.py | 1 +",
+    }
+
+    evidence = tool._collect_goal_git_evidence(repo=repo, replay_evidence=replay)
+
+    assert evidence["adapter_status"] == "replay"
+    assert evidence["repo"] == str(repo)
+    assert evidence["is_clean"] is False
+    assert evidence["changed_files"] == ["changed.py"]
+    assert evidence["staged_files"] == ["staged.py"]
+    assert evidence["untracked_files"] == ["new.py"]
+    assert evidence["diff_stat"] == "changed.py | 2 ++"
+    assert evidence["staged_diff_stat"] == "staged.py | 1 +"
+
+
+@pytest.mark.xfail(reason="Slice 4C pending: composed replay snapshot contract is not implemented yet", strict=True)
+def test_compose_goal_snapshot_replay_feeds_existing_classifier(tmp_path):
+    repo = tmp_path / "repo"
+
+    snapshot = tool._compose_goal_snapshot(
+        session_id="session-1",
+        repo=repo,
+        wait_seconds=5,
+        wait_windows=2,
+        idle_windows=0,
+        process_replay={
+            "process": {"found": True, "still_running": False, "exit_code": 0},
+            "log": {"new_output": "Goal achieved", "raw": "work\nGoal achieved"},
+        },
+        git_replay={"is_clean": False, "changed_files": [], "staged_files": [], "untracked_files": ["new.py"]},
+    )
+
+    assert snapshot["adapter_status"] == {"process": "replay", "git": "replay"}
+    assert snapshot["wait_windows"] == 2
+    assert snapshot["idle_windows"] == 0
+    classified = tool._classify_goal_snapshot(snapshot)
+    assert classified["result_status"] == "completed"
+    assert classified["candidate_evidence"]["untracked_files"] == ["new.py"]
+
+
 def test_missing_goals_feature_is_reported_as_preflight_blocker(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
     monkeypatch.setattr(
