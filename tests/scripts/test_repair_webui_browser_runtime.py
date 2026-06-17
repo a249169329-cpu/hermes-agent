@@ -93,6 +93,25 @@ def test_check_mode_does_not_create_missing_runtime_or_repair_chrome(tmp_path):
     }
 
 
+def test_check_mode_does_not_read_elf_chrome_as_text(tmp_path, monkeypatch):
+    runtime_base = tmp_path / "browser-runtime-libs"
+    package_root = runtime_base / "root"
+    runtime_base.mkdir(mode=0o700)
+    _runtime_fixture(package_root)
+    chrome = _chrome(tmp_path / "home")
+    chrome.write_bytes(b"\x7fELFfake")
+
+    def fail_if_called(path: Path) -> str:
+        raise MemoryError(f"unexpected text read: {path}")
+
+    monkeypatch.setattr(repair, "_read_text", fail_if_called)
+
+    result = repair.run_check(runtime_base, package_root, chrome)
+
+    assert not result.ok
+    assert any(finding.code == "chrome_elf_needs_preserve" for finding in result.findings)
+
+
 def test_repair_preserves_elf_as_chrome_real_and_writes_idempotent_wrapper(tmp_path):
     runtime_base = tmp_path / "browser-runtime-libs"
     package_root = runtime_base / "root"

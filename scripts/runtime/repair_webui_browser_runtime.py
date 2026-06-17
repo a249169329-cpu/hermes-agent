@@ -188,6 +188,8 @@ def _read_text(path: Path) -> str:
 def is_wrapper_ok(chrome: Path, package_root: Path) -> bool:
     if not chrome.is_file():
         return False
+    if _is_elf(chrome):
+        return False
     chrome_real = chrome.with_name("chrome.real")
     text = _read_text(chrome)
     required_exports = (
