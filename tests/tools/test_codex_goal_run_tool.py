@@ -88,6 +88,15 @@ def test_schema_registration_and_toolset_exposure():
     assert toolsets.TOOLSETS["codex_goal_run"]["tools"] == ["codex_goal_run"]
 
 
+@pytest.mark.xfail(reason="Slice 4E pending: adapter gating fields are not exposed in schema yet", strict=True)
+def test_schema_exposes_monitor_adapter_gating_fields():
+    schema = registry.get_schema("codex_goal_run")
+    props = schema["parameters"]["properties"]
+
+    assert props["adapter_enabled"]["type"] == "boolean"
+    assert props["allow_real_adapter"]["type"] == "boolean"
+
+
 def test_codex_goals_preflight_uses_features_list(monkeypatch):
     calls = []
     monkeypatch.setattr(tool.shutil, "which", lambda name: "/tmp/codex-yuna" if name == "codex-yuna" else None)
@@ -411,6 +420,99 @@ def test_monitor_goal_requires_session_id_before_polling(tmp_path, monkeypatch):
     assert result["classification"] == "blocked"
     assert result["next_action"] == "provide_session_id_from_launch_goal"
     assert polls == []
+
+
+def test_monitor_goal_default_uses_mock_poll_not_goal_adapter(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    polls = []
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+
+    def fake_adapter(**kwargs):
+        raise AssertionError("default monitor_goal must not enter adapter call-site")
+
+    def fake_poll(*, session_id, wait_seconds):
+        polls.append({"session_id": session_id, "wait_seconds": wait_seconds})
+        return {"status": "completed", "still_running": False, "exit_code": 0, "new_output": "done"}
+
+    monkeypatch.setattr(tool, "_run_goal_adapter_once", fake_adapter, raising=False)
+    monkeypatch.setattr(tool, "_poll_goal_session", fake_poll, raising=False)
+
+    result = json.loads(
+        tool.codex_goal_run(
+            _args(repo, mode="monitor_goal", session_id="session-1", monitor_interval_seconds=2, max_wait_windows=1)
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["preflight"]["codex"]["reason"] == "monitor_goal_mock_only"
+    assert polls == [{"session_id": "session-1", "wait_seconds": 2}]
+    assert "adapter" not in result
+
+
+@pytest.mark.xfail(reason="Slice 4E pending: monitor_goal adapter call-site authorization gate is not implemented yet", strict=True)
+def test_monitor_goal_adapter_enabled_without_authorization_is_blocked_before_polling(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+    monkeypatch.setattr(
+        tool,
+        "_poll_goal_session",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("adapter path must not use mock poll")),
+        raising=False,
+    )
+
+    result = json.loads(
+        tool.codex_goal_run(
+            _args(
+                repo,
+                mode="monitor_goal",
+                session_id="session-1",
+                adapter_enabled=True,
+                allow_real_adapter=False,
+                monitor_interval_seconds=2,
+            )
+        )
+    )
+
+    assert result["status"] == "real_adapter_not_authorized"
+    assert result["classification"] == "blocked"
+    assert result["next_action"] == "inspect_process_registry"
+    assert result["adapter"]["adapter_status"] == "blocked"
+    assert result["adapter"]["blockers"] == ["real_adapter_not_authorized"]
+    assert result["preflight"]["codex"]["reason"] == "monitor_goal_adapter_call_site"
+    assert result["preflight"]["codex"]["allow_real_adapter"] is False
+    assert result["completion_trusted"] is False
+
+
+@pytest.mark.xfail(reason="Slice 4E pending: monitor_goal real adapter call-site must fail closed without runners", strict=True)
+def test_monitor_goal_adapter_authorized_without_runners_fails_closed(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+    monkeypatch.setattr(
+        tool,
+        "_poll_goal_session",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("adapter path must not use mock poll")),
+        raising=False,
+    )
+
+    result = json.loads(
+        tool.codex_goal_run(
+            _args(
+                repo,
+                mode="monitor_goal",
+                session_id="session-1",
+                adapter_enabled=True,
+                allow_real_adapter=True,
+                monitor_interval_seconds=2,
+            )
+        )
+    )
+
+    assert result["status"] == "real_adapter_runner_missing"
+    assert result["classification"] == "blocked"
+    assert result["adapter"]["adapter_status"] == "blocked"
+    assert result["adapter"]["blockers"] == ["missing_process_runner", "missing_git_runner"]
+    assert result["preflight"]["codex"]["allow_real_adapter"] is True
+    assert result["completion_trusted"] is False
 
 
 def test_bounded_log_tail_limits_lines_and_chars_without_raw_flood():
