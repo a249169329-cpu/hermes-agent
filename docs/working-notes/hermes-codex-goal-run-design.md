@@ -1,6 +1,6 @@
 # `codex_goal_run` Runtime Driver Design
 
-> 状态：设计文档 / implementation plan；Slice 1-7F mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、smoke hardening、`collect_candidate` review handoff、`review_candidate` replay review lane、真实 review runner adapter call-site、bounded packet review guard adapter、subprocess-backed guard runner wrapper、以及显式 opt-in runtime subprocess gate 已实现；真实 guard subprocess runner 仍默认关闭。
+> 状态：设计文档 / implementation plan；Slice 1-7G mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、smoke hardening、`collect_candidate` review handoff、`review_candidate` replay review lane、真实 review runner adapter call-site、bounded packet review guard adapter、subprocess-backed guard runner wrapper、显式 opt-in runtime subprocess gate、以及 closeout 收口决策已完成；真实 guard subprocess runner 仍默认关闭。
 > 日期：2026-06-17
 > 关联文档：
 > - `docs/working-notes/hermes-codex-division-of-labor.md`
@@ -12,7 +12,7 @@
 
 ## 0. 当前实现快照
 
-截至 2026-06-17，本设计已分片落地 mock-first/replay 骨架：
+截至 2026-06-17，本设计已分片落地 mock-first/replay 骨架并完成首版 closeout：
 
 | Slice | commit | 覆盖范围 | 真实 TUI |
 |---|---|---|---|
@@ -32,6 +32,7 @@
 | Slice 7D | bounded packet review guard adapter | `review_guard_enabled=True` 时构造 packet-only prompt；fake guard runner 返回 passed/blocked/unavailable 会映射到 review_candidate 状态 | 否 |
 | Slice 7E | subprocess-backed guard runner wrapper | `_run_candidate_review_guard_subprocess` 写 bounded packet/prompt artifacts 并调用 `codex_review_guard.py --review-packet-file`；默认不注入 | 否 |
 | Slice 7F | explicit subprocess runtime gate | `review_guard_subprocess_enabled=True` 且四重 gate 满足时才把 7E wrapper 接入 `review_candidate`；默认/未授权均不调用 subprocess | 否 |
+| Slice 7G | closeout / final acceptance decision | 收口验收 Slice 1-7F，确认首版停止在 disabled-by-default / explicit-authorization-only，本地 verified commit；后续 orchestrator 另行设计 | 否 |
 
 详细对照表与 Slice 4 边界计划见：
 
@@ -46,6 +47,7 @@ docs/working-notes/hermes-codex-goal-run-slice-handoff.md
 不执行真实 `codex-yuna --enable goals`。
 不调用 terminal/process tool 作为 monitor adapter。
 默认不执行 review guard / review packet runner；只有显式四重 gate 才进入 subprocess-backed guard path。
+Slice 7G 不新增 runtime path；它只是 closeout / acceptance 决策。
 不 push / deploy / restart。
 ```
 
@@ -826,19 +828,21 @@ git diff --check HEAD
 - 未授权不调用 subprocess wrapper；
 - 显式四重 opt-in 使用 fake subprocess runner 验证 packet file、`shell=False`、不调用 raw TUI / `codex-yuna --enable goals`。
 
-### Slice 7G / closeout（后续）：final acceptance / orchestrator decision
+### Slice 7G / closeout（已完成）：final acceptance / orchestrator decision
 
 功能：
 
-- 收口验收 Slice 1-7F；
-- 复核是否还需要更高层 orchestrator 汇总，或先停止在本地 verified commit；
+- 已收口验收 Slice 1-7F；
+- 已确认首版停止在本地 verified commit；
+- 后续若继续，需要进入更高层 orchestrator 汇总/设计，并重新明确授权；
 - 默认不再新增真实运行路径。
 
 测试：
 
-- focused tests 保持全绿；
+- focused tests fresh gate 保持全绿；
 - docs 与 schema 不过度承诺真实 review 已自动启用；
-- 不调用 raw TUI / `codex-yuna --enable goals`。
+- 安全扫描确认不调用 raw TUI / `codex-yuna --enable goals`；
+- 真实 TUI 和真实 review subprocess 仍需显式新授权。
 
 ## 16. 不建议首版做的事
 
@@ -883,13 +887,13 @@ git diff --check HEAD
 
 ## 19. 下一步建议
 
-若继续进入实现，下一步建议是 **Slice 7G / closeout：final acceptance / orchestrator decision**，默认不再跑真实 TUI。
+Slice 7G closeout 后，首版 `codex_goal_run` driver 应停止在本地 verified commit；后续若继续，建议进入 **higher-level orchestrator decision**，默认不再跑真实 TUI。
 
 理由：
 
 ```text
-Slice 1-7F 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke、smoke hardening、collect_candidate review handoff、review_candidate replay lane、real review runner adapter call-site、bounded packet review guard adapter、subprocess-backed guard runner wrapper 和 explicit subprocess runtime gate。
-下一步只需要收口验收或决定是否进入更高层 orchestrator 汇总。
+Slice 1-7G 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke、smoke hardening、collect_candidate review handoff、review_candidate replay lane、real review runner adapter call-site、bounded packet review guard adapter、subprocess-backed guard runner wrapper、explicit subprocess runtime gate 和 closeout acceptance。
+下一步只应在新授权下做更高层 orchestrator 汇总/设计。
 默认不再启动真实 TUI；只有用户重新明确授权时才重跑 smoke。
 ```
 
@@ -902,3 +906,22 @@ do not repeat real TUI smoke
 ```
 
 不要直接做真实 `launch_goal` / `codex-yuna --enable goals`。
+
+## 20. Slice 7G closeout 决策
+
+Slice 7G 的结论：
+
+```text
+首版 `codex_goal_run` driver 到此收口。
+runtime 默认仍是 mock/replay/disabled-first。
+真实 TUI 和真实 review subprocess 都需要显式新授权。
+下一步不是继续打开真实路径，而是先做 higher-level orchestrator decision。
+```
+
+验收口径：
+
+1. docs 不宣称默认真实 TUI 或默认真实 review 已启用。
+2. `review_candidate` 的 subprocess path 保持四重 opt-in：`review_runner_enabled=True` + `allow_real_review=True` + `review_guard_enabled=True` + `review_guard_subprocess_enabled=True`。
+3. `completion_trusted` 仍不能因为 Codex self-report 或 review runner output 自动变 true。
+4. 后续 orchestrator 如果要统一 ordinary guarded lane 和 TUI Goal lane，需要单独设计：阶段选择、授权门、candidate packet、review handoff、failure taxonomy、QQ status reporting。
+5. 不 push / deploy / restart；本阶段只允许本地 commit。
