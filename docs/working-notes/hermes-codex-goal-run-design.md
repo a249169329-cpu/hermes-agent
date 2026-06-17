@@ -1,6 +1,6 @@
 # `codex_goal_run` Runtime Driver Design
 
-> 状态：设计文档 / implementation plan；Slice 1-4D mock-first/replay/gated runtime skeleton 已实现，真实 TUI 尚未接入。
+> 状态：设计文档 / implementation plan；Slice 1-4E mock-first/replay/gated runtime skeleton 已实现，真实 TUI 尚未接入。
 > 日期：2026-06-16
 > 关联文档：
 > - `docs/working-notes/hermes-codex-division-of-labor.md`
@@ -21,6 +21,7 @@
 | Slice 4A/4B | `3990f8e68 feat(codex): add goal snapshot classifier` | `_bounded_log_tail` + `_classify_goal_snapshot` replay classifier；process/log/git evidence → monitor states | 否 |
 | Slice 4C | `a43dc5684 feat(codex): add disabled goal adapter wrappers` | `_collect_goal_process_snapshot` / `_collect_goal_git_evidence` / `_compose_goal_snapshot` disabled/replay wrappers | 否 |
 | Slice 4D | `f55af62e5 feat(codex): add gated goal adapter runner` | `_goal_adapter_stop_condition` / `_run_goal_adapter_once` gated runner interface，默认 disabled | 否 |
+| Slice 4E | `00a576d51 feat(codex): wire gated adapter call-site` | `monitor_goal` adapter call-site；schema 暴露 `adapter_enabled` / `allow_real_adapter`；默认旧 mock poll | 否 |
 
 详细对照表与 Slice 4 边界计划见：
 
@@ -648,7 +649,7 @@ git diff --check HEAD
 - process exited with diff；
 - untracked files included。
 
-### Slice 4：real adapter contract / replay classifier，不接真实 TUI（4A/4B/4C/4D 已实现）
+### Slice 4：real adapter contract / replay classifier，不接真实 TUI（4A/4B/4C/4D/4E 已实现）
 
 功能：
 
@@ -657,6 +658,7 @@ git diff --check HEAD
 - 新增纯函数 classifier，例如 process running/output、idle no diff、process exited with diff、pasted content suspected、process missing；（已完成）
 - 新增默认 disabled/replay-only adapter wrappers：`_collect_goal_process_snapshot` / `_collect_goal_git_evidence` / `_compose_goal_snapshot`；（已完成）
 - 新增 gated runner interface 和 stop condition：`_run_goal_adapter_once` / `_goal_adapter_stop_condition`；（已完成）
+- 新增 `monitor_goal` call-site：默认旧 mock poll，显式 `adapter_enabled=True` 才进入 gated adapter path；（已完成）
 - 默认仍 disabled/mock-only，不调用真实 terminal/process，不启动 `codex-yuna --enable goals`。
 
 测试：
@@ -674,7 +676,10 @@ git diff --check HEAD
 - default runner disabled 不调用 runner；
 - unauthorized runner 不调用 runner；
 - authorized path 当前只调用 injected fake runner；
-- failed / needs_attention / process_missing stop reason 不被泛化成 blocked。
+- failed / needs_attention / process_missing stop reason 不被泛化成 blocked；
+- schema 暴露 `adapter_enabled` / `allow_real_adapter`；
+- `monitor_goal` 默认路径仍走 `_poll_goal_session` mock；
+- `monitor_goal` adapter path 不走 `_poll_goal_session`，未授权/无 runner 都 fail-closed。
 
 ### Slice 5：review handoff integration
 
@@ -733,22 +738,22 @@ git diff --check HEAD
 
 ## 19. 下一步建议
 
-若继续进入实现，建议先做 **Slice 4E：真实 adapter 调用点接入方式，仍默认 disabled**。
+若继续进入实现，建议先做 **Slice 4F：最小真实 TUI smoke runbook（只写 runbook，不执行）**。
 
 理由：
 
 ```text
-Slice 1-4D 已完成 mock/replay/disabled-wrapper/gated-runner skeleton。
-下一步应设计真实 adapter 调用点如何挂到 gated runner，但仍默认 disabled。
-等真实 adapter 调用点的边界和 stop condition 稳定后，再考虑真实 TUI smoke。
+Slice 1-4E 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton。
+下一步应写最小真实 TUI smoke runbook，明确授权、stop condition、证据和回滚，但不执行。
+等 runbook 被审查后，再由用户单独授权真实 TUI smoke。
 ```
 
 下一阶段应停止在：
 
 ```text
-real adapter call-site contract
-adapter_enabled / allow_real_adapter gating kept fail-closed
-no real terminal/process call by default
+minimal real TUI smoke runbook
+authorization / stop condition / evidence checklist
+no real TUI execution
 ```
 
 不要直接做真实 `launch_goal` / `codex-yuna --enable goals`。
