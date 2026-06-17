@@ -1,6 +1,6 @@
 # `codex_goal_run` Runtime Driver Design
 
-> 状态：设计文档 / implementation plan；Slice 1-7A mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、smoke hardening、以及 `collect_candidate` review handoff 已实现；真实 adapter 仍未接入 runtime 默认路径。
+> 状态：设计文档 / implementation plan；Slice 1-7B mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、smoke hardening、`collect_candidate` review handoff、以及 `review_candidate` replay review lane 已实现；真实 adapter 仍未接入 runtime 默认路径。
 > 日期：2026-06-17
 > 关联文档：
 > - `docs/working-notes/hermes-codex-division-of-labor.md`
@@ -27,6 +27,7 @@
 | Slice 5 | authorized real TUI smoke | 在 isolated `/tmp` worktree 启动一次 `codex-yuna --enable goals`；产出 untracked marker candidate；TUI exit 0 | 是，仅一次授权 smoke |
 | Slice 6 | `test/docs(codex): harden goal TUI smoke learnings` | 固化 smoke 经验：`Goal blocked` + candidate evidence => candidate ready；测试通过 monkeypatched `_TMP_ROOT` 不再假设 `Path.cwd()` outside `/tmp` | 否 |
 | Slice 7A | `collect_candidate` review handoff | dirty candidate worktree 可收集 tracked/staged/untracked/diff_stat/status evidence；生成 bounded `review_handoff.review_packet` | 否 |
+| Slice 7B | `review_candidate` replay review lane | 复用 candidate packet；接收 `review_replay`；分类 passed / blocked / unavailable；默认 review runner disabled | 否 |
 
 详细对照表与 Slice 4 边界计划见：
 
@@ -721,19 +722,37 @@ git diff --check HEAD
 - `collect_candidate` 不触发 Codex preflight、TUI launch、TUI poll hooks；
 - `completion_trusted=false`。
 
-### Slice 7B（后续）：review runner integration
+### Slice 7B：review_candidate replay review lane（已实现）
 
 功能：
 
-- 将 Slice 7A 的 bounded review packet 接到后续 review lane；
-- staged/unstaged/untracked 包含完整；
-- review unavailable 不算 pass。
+- 新增 `review_candidate` mode；
+- 复用 Slice 7A 的 candidate evidence 与 `review_handoff.review_packet`；
+- 默认 `review_runner_disabled`，不执行真实 review guard / review packet runner；
+- `review_replay.status=passed` 且无 `must_fix`、无 `blockers` 时返回 `review_passed`，但仍需要 verification，`completion_trusted=false`；
+- `review_replay.reason=aggregated_output_flood` / `review_unusable` / `packet_truncated` 时返回 `review_unavailable`，不算 pass；
+- review blocked 时返回 `review_blocked` / `fix_review_blockers`。
 
 测试：
 
-- untracked-only candidate 不丢；
-- staged-only candidate 不丢；
-- `aggregated_output_flood` 显示 `review_unavailable`。
+- replay passed 不 trusted，下一步仍要求 verification；
+- `aggregated_output_flood` / `review_unusable` / `packet_truncated` 显示 `review_unavailable`，不算 pass；
+- `status=passed` 但含普通 blockers / `must_fix` 时仍返回 `review_blocked`；
+- 默认 disabled 与 replay path 都不触发 Codex preflight / TUI launch / TUI poll hooks。
+
+### Slice 7C（后续）：real review runner adapter call-site
+
+功能：
+
+- 将 `review_candidate` 的 replay/fake contract 接到真实 review runner adapter 前的 fail-closed call-site；
+- 真实 runner 默认 disabled；
+- 授权前只返回 `real_review_not_authorized` / `review_runner_missing`，不执行 Codex。
+
+测试：
+
+- unauthorized path 不调用 runner；
+- `allow_real_review=True` 但缺 runner 返回 missing；
+- fake injected runner 只接收 bounded packet，不接收 raw TUI log。
 
 ## 16. 不建议首版做的事
 
@@ -778,21 +797,21 @@ git diff --check HEAD
 
 ## 19. 下一步建议
 
-若继续进入实现，下一步建议是 **Slice 7B：review runner integration for collect_candidate packet**，默认不再跑真实 TUI。
+若继续进入实现，下一步建议是 **Slice 7C：real review runner adapter call-site**，默认不再跑真实 TUI。
 
 理由：
 
 ```text
-Slice 1-7A 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke、smoke hardening 和 collect_candidate review handoff。
-下一步才考虑把 collect_candidate packet 接到 Hermes/Codex review runner。
+Slice 1-7B 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke、smoke hardening、collect_candidate review handoff 和 review_candidate replay lane。
+下一步才考虑把 review_candidate 的 fake/replay contract 接到真实 review runner adapter call-site。
 默认不再启动真实 TUI；只有用户重新明确授权时才重跑 smoke。
 ```
 
 下一阶段应停止在：
 
 ```text
-review runner integration for collect_candidate packet
-keep staged/unstaged/untracked candidate files in packet
+real review runner adapter call-site
+default disabled/fail-closed
 do not repeat real TUI smoke
 ```
 

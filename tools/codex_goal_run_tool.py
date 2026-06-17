@@ -8,7 +8,7 @@ from typing import Any
 from tools.registry import registry
 
 
-_SUPPORTED_MODES = {"dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal", "collect_candidate"}
+_SUPPORTED_MODES = {"dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal", "collect_candidate", "review_candidate"}
 _SUPPORTED_DIRTY_POLICY = "require-clean"
 _DRIVER = "codex_tui_goal"
 _DEFAULT_ARTIFACT_ROOT = Path("/tmp/hermes-codex-goals")
@@ -170,6 +170,95 @@ def _build_candidate_review_handoff(
                 "treat_codex_goal_output_as_untrusted_candidate_evidence",
             ],
         },
+    }
+
+
+def _normalize_candidate_review_replay(review_replay: dict[str, Any]) -> dict[str, Any]:
+    raw_status = str(review_replay.get("status") or "").strip().lower()
+    raw_reason = str(review_replay.get("reason") or "").strip().lower()
+    must_fix = _string_list(review_replay.get("must_fix"))
+    suggestions = _string_list(review_replay.get("suggestions"))
+    unavailable_markers = {"aggregated_output_flood", "review_unusable", "review_unavailable", "packet_truncated"}
+    blockers = _string_list(review_replay.get("blockers"))
+    unavailable_blockers = [blocker for blocker in blockers if blocker.lower() in unavailable_markers]
+
+    if (
+        raw_reason in unavailable_markers
+        or raw_status in unavailable_markers
+        or unavailable_blockers
+        or review_replay.get("review_unusable") is True
+    ):
+        blocker = raw_reason if raw_reason in unavailable_markers else raw_status if raw_status in unavailable_markers else unavailable_blockers[0] if unavailable_blockers else "review_unavailable"
+        return {
+            "status": "review_unavailable",
+            "reason": blocker,
+            "blockers": _string_list([blocker, *blockers]),
+            "must_fix": must_fix,
+            "suggestions": suggestions,
+            "completion_trusted": False,
+        }
+
+    if raw_status == "passed" and not must_fix and not blockers:
+        return {
+            "status": "passed",
+            "reason": "replay_passed",
+            "blockers": [],
+            "must_fix": [],
+            "suggestions": suggestions,
+            "completion_trusted": False,
+        }
+
+    return {
+        "status": "review_blocked",
+        "reason": raw_reason or raw_status or "review_blocked",
+        "blockers": must_fix or blockers or [raw_reason or raw_status or "review_blocked"],
+        "must_fix": must_fix,
+        "suggestions": suggestions,
+        "completion_trusted": False,
+    }
+
+
+def _run_candidate_review_once(
+    *,
+    review_handoff: dict[str, Any],
+    review_runner_enabled: bool = False,
+    allow_real_review: bool = False,
+    review_replay: dict[str, Any] | None = None,
+    review_runner: Any = None,
+) -> dict[str, Any]:
+    if not review_runner_enabled:
+        return {
+            "status": "review_runner_disabled",
+            "blockers": ["review_runner_disabled"],
+            "completion_trusted": False,
+        }
+
+    if isinstance(review_replay, dict):
+        return _normalize_candidate_review_replay(review_replay)
+
+    if not allow_real_review:
+        return {
+            "status": "real_review_not_authorized",
+            "blockers": ["real_review_not_authorized"],
+            "completion_trusted": False,
+        }
+
+    if not callable(review_runner):
+        return {
+            "status": "review_runner_missing",
+            "blockers": ["missing_review_runner"],
+            "completion_trusted": False,
+        }
+
+    review_packet = review_handoff.get("review_packet") if isinstance(review_handoff, dict) else {}
+    review_result = review_runner(review_packet=review_packet)
+    if isinstance(review_result, dict):
+        return _normalize_candidate_review_replay(review_result)
+    return {
+        "status": "review_unavailable",
+        "reason": "invalid_review_runner_result",
+        "blockers": ["invalid_review_runner_result"],
+        "completion_trusted": False,
     }
 
 
@@ -986,9 +1075,9 @@ def codex_goal_run(args: dict[str, Any]) -> str:
                 stage_id=args.get("stage_id"),
                 preflight={"status": "not_run", "blockers": ["unsupported_mode"]},
                 classification="rejected",
-                next_action="use_dry_run_plan_prepare_goal_launch_goal_monitor_goal_or_collect_candidate",
+                next_action="use_dry_run_plan_prepare_goal_launch_goal_monitor_goal_collect_candidate_or_review_candidate",
                 candidate_disposition="planning_only",
-                reason="Supported modes are dry_run_plan, prepare_goal, launch_goal, monitor_goal, and collect_candidate.",
+                reason="Supported modes are dry_run_plan, prepare_goal, launch_goal, monitor_goal, collect_candidate, and review_candidate.",
             )
         )
 
@@ -1165,6 +1254,87 @@ def codex_goal_run(args: dict[str, Any]) -> str:
                 plan=plan,
                 candidate_evidence=candidate_evidence,
                 review_handoff=review_handoff,
+            )
+        )
+
+    if mode == "review_candidate":
+        candidate_evidence = _collect_candidate_git_evidence(repo)
+        has_candidate_changes = bool(
+            candidate_evidence.get("changed_files")
+            or candidate_evidence.get("staged_files")
+            or candidate_evidence.get("untracked_files")
+        )
+        review_handoff = _build_candidate_review_handoff(
+            repo=repo,
+            args=args,
+            git_head=git_head,
+            dirty=dirty,
+            candidate_evidence=candidate_evidence,
+        )
+        review_replay = args.get("review_replay") if isinstance(args.get("review_replay"), dict) else None
+        review_runner_enabled = args.get("review_runner_enabled") is True
+        allow_real_review = args.get("allow_real_review") is True
+        review = _run_candidate_review_once(
+            review_handoff=review_handoff,
+            review_runner_enabled=review_runner_enabled,
+            allow_real_review=allow_real_review,
+            review_replay=review_replay,
+        )
+        if not has_candidate_changes:
+            status = "no_candidate_changes"
+            classification = "blocked"
+            next_action = "inspect_no_candidate_changes"
+            disposition = "planning_only"
+        elif review["status"] == "passed":
+            status = "review_passed"
+            classification = "reviewed"
+            next_action = "run_required_verification_before_commit"
+            disposition = "needs_verification"
+        elif review["status"] == "review_unavailable":
+            status = "review_unavailable"
+            classification = "blocked"
+            next_action = "retry_with_bounded_packet_or_manual_review"
+            disposition = "needs_review"
+        elif review["status"] == "review_blocked":
+            status = "review_blocked"
+            classification = "blocked"
+            next_action = "fix_review_blockers"
+            disposition = "needs_revision"
+        else:
+            status = str(review.get("status") or "review_unavailable")
+            classification = "blocked"
+            next_action = "run_manual_or_guarded_review"
+            disposition = "needs_review"
+        return _json_result(
+            _base_result(
+                status=status,
+                mode=mode,
+                workdir=repo,
+                stage_id=args.get("stage_id"),
+                preflight={
+                    "status": "reviewing" if has_candidate_changes else "no_candidate_changes",
+                    "blockers": [] if has_candidate_changes else ["no_candidate_changes"],
+                    "dirty_check": dirty,
+                    "codex": {
+                        "status": "not_run",
+                        "reason": (
+                            "review_candidate_replay"
+                            if review_replay is not None
+                            else "review_candidate_disabled"
+                            if not review_runner_enabled
+                            else "review_candidate_gated"
+                        ),
+                    },
+                },
+                classification=classification,
+                next_action=next_action,
+                candidate_disposition=disposition,
+                dirty_baseline_policy=dirty_policy,
+                git_head=git_head,
+                plan=plan,
+                candidate_evidence=candidate_evidence,
+                review_handoff=review_handoff,
+                review=review,
             )
         )
 
@@ -1351,7 +1521,7 @@ _SCHEMA = {
             "non_goals": {"type": "array", "items": {"type": "string"}},
             "required_verification": {"type": "array", "items": {"type": "string"}},
             "stop_conditions": {"type": "array", "items": {"type": "string"}},
-            "mode": {"type": "string", "enum": ["dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal", "collect_candidate"]},
+            "mode": {"type": "string", "enum": ["dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal", "collect_candidate", "review_candidate"]},
             "dirty_baseline_policy": {"type": "string", "enum": ["require-clean"]},
             "allow_isolated_worktree": {"type": "boolean"},
             "goal_artifact_dir": {"type": "string"},
@@ -1364,6 +1534,9 @@ _SCHEMA = {
             "standing_authorization": {"type": "boolean"},
             "adapter_enabled": {"type": "boolean"},
             "allow_real_adapter": {"type": "boolean"},
+            "review_runner_enabled": {"type": "boolean"},
+            "allow_real_review": {"type": "boolean"},
+            "review_replay": {"type": "object"},
         },
         "required": ["workdir", "stage_id", "objective", "mode", "dirty_baseline_policy"],
     },

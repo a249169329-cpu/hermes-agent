@@ -81,7 +81,14 @@ def test_schema_registration_and_toolset_exposure():
         "mode",
         "dirty_baseline_policy",
     ]
-    assert props["mode"]["enum"] == ["dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal", "collect_candidate"]
+    assert props["mode"]["enum"] == [
+        "dry_run_plan",
+        "prepare_goal",
+        "launch_goal",
+        "monitor_goal",
+        "collect_candidate",
+        "review_candidate",
+    ]
     assert props["standing_authorization"]["type"] == "boolean"
     assert "codex_goal_run" in toolsets._HERMES_CORE_TOOLS
     assert toolsets.TOOLSETS["codex_goal_run"]["tools"] == ["codex_goal_run"]
@@ -93,6 +100,15 @@ def test_schema_exposes_monitor_adapter_gating_fields():
 
     assert props["adapter_enabled"]["type"] == "boolean"
     assert props["allow_real_adapter"]["type"] == "boolean"
+
+
+def test_schema_exposes_review_candidate_replay_gating_fields():
+    schema = registry.get_schema("codex_goal_run")
+    props = schema["parameters"]["properties"]
+
+    assert props["review_runner_enabled"]["type"] == "boolean"
+    assert props["allow_real_review"]["type"] == "boolean"
+    assert props["review_replay"]["type"] == "object"
 
 
 def test_collect_candidate_allows_dirty_repo_and_builds_review_handoff(tmp_path):
@@ -172,6 +188,169 @@ def test_collect_candidate_does_not_run_codex_preflight_or_tui_hooks(tmp_path, m
     assert result["status"] == "candidate_ready_for_review"
     assert result["preflight"]["codex"] == {"status": "not_run", "reason": "collect_candidate_only"}
     assert result["candidate_evidence"]["untracked_files"] == ["candidate.md"]
+
+
+def test_review_candidate_replay_passes_packet_without_trusting_completion(tmp_path):
+    repo = _clean_repo(tmp_path)
+    (repo / "README.md").write_text("hello\ntracked change\n", encoding="utf-8")
+    staged = repo / "staged.py"
+    staged.write_text("print('staged')\n", encoding="utf-8")
+    _git(repo, "add", "staged.py")
+    (repo / "notes.md").write_text("untracked candidate note\n", encoding="utf-8")
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7b",
+        objective="Review Goal candidate packet",
+        review_runner_enabled=True,
+        review_replay={"status": "passed", "must_fix": [], "suggestions": ["optional polish"]},
+        required_verification=["python3 -m pytest tests/tools/test_codex_goal_run_tool.py -q -o addopts=''"],
+    )
+
+    assert result["status"] == "review_passed"
+    assert result["classification"] == "reviewed"
+    assert result["candidate_disposition"] == "needs_verification"
+    assert result["next_action"] == "run_required_verification_before_commit"
+    assert result["completion_trusted"] is False
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "review_candidate_replay"}
+    assert result["candidate_evidence"]["changed_files"] == ["README.md"]
+    assert result["candidate_evidence"]["staged_files"] == ["staged.py"]
+    assert result["candidate_evidence"]["untracked_files"] == ["notes.md"]
+    assert result["review"]["status"] == "passed"
+    assert result["review"]["completion_trusted"] is False
+    assert result["review"]["must_fix"] == []
+    assert result["review_handoff"]["review_packet"]["candidate_evidence"] == result["candidate_evidence"]
+
+
+def test_review_candidate_aggregated_output_flood_is_unavailable_not_passed(tmp_path):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7b",
+        review_runner_enabled=True,
+        review_replay={"status": "failed", "reason": "aggregated_output_flood", "must_fix": []},
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "retry_with_bounded_packet_or_manual_review"
+    assert result["completion_trusted"] is False
+    assert result["review"]["status"] == "review_unavailable"
+    assert "aggregated_output_flood" in result["review"]["blockers"]
+
+
+def test_review_candidate_unavailable_marker_in_blockers_is_unavailable_not_passed(tmp_path):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7b",
+        review_runner_enabled=True,
+        review_replay={"status": "passed", "must_fix": [], "blockers": ["packet_truncated"]},
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "retry_with_bounded_packet_or_manual_review"
+    assert result["completion_trusted"] is False
+    assert result["review"]["status"] == "review_unavailable"
+    assert "packet_truncated" in result["review"]["blockers"]
+
+
+def test_review_candidate_passed_with_ordinary_blockers_is_blocked_not_passed(tmp_path):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7b",
+        review_runner_enabled=True,
+        review_replay={"status": "passed", "must_fix": [], "blockers": ["scope_mismatch"]},
+    )
+
+    assert result["status"] == "review_blocked"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_revision"
+    assert result["next_action"] == "fix_review_blockers"
+    assert result["completion_trusted"] is False
+    assert result["review"]["status"] == "review_blocked"
+    assert result["review"]["blockers"] == ["scope_mismatch"]
+
+
+def test_review_candidate_must_fix_is_blocked_not_passed(tmp_path):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7b",
+        review_runner_enabled=True,
+        review_replay={"status": "passed", "must_fix": ["fix fail-closed handling"], "blockers": []},
+    )
+
+    assert result["status"] == "review_blocked"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_revision"
+    assert result["next_action"] == "fix_review_blockers"
+    assert result["completion_trusted"] is False
+    assert result["review"]["status"] == "review_blocked"
+    assert result["review"]["must_fix"] == ["fix fail-closed handling"]
+
+
+def test_review_candidate_replay_path_does_not_run_codex_preflight_or_tui_hooks(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    def forbidden_hook(*args, **kwargs):
+        raise AssertionError("review_candidate replay must not run Codex preflight, launch TUI, or poll TUI session")
+
+    monkeypatch.setattr(tool, "_codex_goals_preflight", forbidden_hook)
+    monkeypatch.setattr(tool, "_launch_goal_tui", forbidden_hook, raising=False)
+    monkeypatch.setattr(tool, "_poll_goal_session", forbidden_hook, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7b",
+        review_runner_enabled=True,
+        review_replay={"status": "passed", "must_fix": [], "suggestions": []},
+    )
+
+    assert result["status"] == "review_passed"
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "review_candidate_replay"}
+    assert result["completion_trusted"] is False
+
+
+def test_review_candidate_default_is_disabled_and_does_not_run_tui_or_codex_preflight(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    def forbidden_hook(*args, **kwargs):
+        raise AssertionError("review_candidate must not run Codex preflight, launch TUI, or poll TUI session")
+
+    monkeypatch.setattr(tool, "_codex_goals_preflight", forbidden_hook)
+    monkeypatch.setattr(tool, "_launch_goal_tui", forbidden_hook, raising=False)
+    monkeypatch.setattr(tool, "_poll_goal_session", forbidden_hook, raising=False)
+
+    result = _call(repo, mode="review_candidate", stage_id="slice-7b")
+
+    assert result["status"] == "review_runner_disabled"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "run_manual_or_guarded_review"
+    assert result["completion_trusted"] is False
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "review_candidate_disabled"}
+    assert result["review"]["blockers"] == ["review_runner_disabled"]
 
 
 def test_codex_goals_preflight_uses_features_list(monkeypatch):
@@ -321,6 +500,7 @@ def test_monitor_goal_mode_is_schema_exposed():
         "launch_goal",
         "monitor_goal",
         "collect_candidate",
+        "review_candidate",
     ]
 
 
