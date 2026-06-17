@@ -76,9 +76,9 @@ class TestSchema:
         # Shared
         assert "role_filter" in params
 
-    def test_mode_parameter_includes_previous_handoff(self):
+    def test_mode_parameter_includes_current_previous_handoff(self):
         params = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
-        assert params["mode"]["enum"] == ["previous", "handoff"]
+        assert params["mode"]["enum"] == ["current", "previous", "handoff"]
         assert params["scope"]["enum"] == ["current", "global"]
 
     def test_sort_enum(self):
@@ -196,6 +196,81 @@ class TestScopedGatewayRecall:
         sids = [r["session_id"] for r in result["results"]]
         assert "a_old" in sids
         assert "b_old" not in sids
+
+    def test_current_mode_reads_active_session_without_keyword_discovery(self, db):
+        """Current-chat questions should not keyword-search old same-DM topics."""
+        self._create_scoped_session(
+            db,
+            "fable_old",
+            chat_id="qq-a",
+            user_id="qq-a",
+            text="Fable5 prompt absorption review from an older session",
+        )
+        self._create_scoped_session(
+            db,
+            "codex_current",
+            chat_id="qq-a",
+            user_id="qq-a",
+            text="Codex orchestrator 对照表 current session opening",
+        )
+
+        result = json.loads(session_search(
+            mode="current",
+            query="Fable5 OR Codex OR 开头",  # must be ignored by current mode
+            db=db,
+            current_session_id="codex_current",
+            current_source="qqbot",
+            current_chat_type="dm",
+            current_chat_id="qq-a",
+            current_user_id="qq-a",
+        ))
+
+        assert result["success"] is True
+        assert result["mode"] == "current"
+        assert result["session_id"] == "codex_current"
+        payload = json.dumps(result, ensure_ascii=False)
+        assert "Codex orchestrator 对照表" in payload
+        assert "fable_old" not in payload
+        assert "Fable5 prompt absorption" not in payload
+
+    def test_current_mode_reads_compression_lineage_opening(self, db):
+        db.create_session(
+            "root_session",
+            source="qqbot",
+            user_id="qq-a",
+            chat_type="dm",
+            chat_id="qq-a",
+        )
+        db.append_message("root_session", role="user", content="会话开头：Codex /goal 对照表")
+        db.append_message("root_session", role="assistant", content="开始整理对照表")
+        db.end_session("root_session", "compression")
+        db.create_session(
+            "child_session",
+            source="qqbot",
+            user_id="qq-a",
+            chat_type="dm",
+            chat_id="qq-a",
+            parent_session_id="root_session",
+        )
+        db.append_message("child_session", role="user", content="压缩后继续修 session_search")
+
+        result = json.loads(session_search(
+            mode="current",
+            db=db,
+            current_session_id="child_session",
+            current_source="qqbot",
+            current_chat_type="dm",
+            current_chat_id="qq-a",
+            current_user_id="qq-a",
+        ))
+
+        assert result["success"] is True
+        assert result["mode"] == "current"
+        assert result["session_id"] == "child_session"
+        assert result["lineage_session_ids"] == ["root_session", "child_session"]
+        payload = json.dumps(result, ensure_ascii=False)
+        assert "会话开头：Codex /goal 对照表" in payload
+        assert "压缩后继续修 session_search" in payload
 
     def test_handoff_returns_recent_ended_session_not_adjacent_project(self, db):
         now = time.time()

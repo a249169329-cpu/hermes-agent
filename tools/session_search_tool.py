@@ -349,6 +349,82 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
     return json.dumps(response, ensure_ascii=False)
 
 
+def _read_current_session(db, current_session_id: str, head: int = 20, tail: int = 10) -> str:
+    """Return the active session lineage without keyword search.
+
+    This is the safe shape for user asks like "本会话开头 / 这个会话 / 当前对话".
+    It uses the hidden ``current_session_id`` supplied by the runtime, so the
+    model does not have to invent a query that might hit older same-chat topics.
+    """
+    if not current_session_id:
+        return tool_error("current mode requires an active current_session_id", success=False)
+
+    try:
+        meta = db.get_session(current_session_id) or {}
+    except Exception as e:
+        logging.debug("get_session failed for current session %s: %s", current_session_id, e, exc_info=True)
+        meta = {}
+    if not meta:
+        return tool_error(f"current_session_id not found: {current_session_id}", success=False)
+
+    try:
+        lineage_ids = db._session_lineage_root_to_tip(current_session_id)
+    except Exception as e:
+        logging.debug("lineage lookup failed for current session %s: %s", current_session_id, e, exc_info=True)
+        lineage_ids = [current_session_id]
+    if current_session_id not in lineage_ids:
+        lineage_ids.append(current_session_id)
+
+    lineage_meta = []
+    rows = []
+    for sid in lineage_ids:
+        try:
+            s_meta = db.get_session(sid) or {}
+        except Exception:
+            s_meta = {}
+        lineage_meta.append({
+            "session_id": sid,
+            "title": s_meta.get("title") or None,
+            "source": s_meta.get("source"),
+            "started_at": s_meta.get("started_at"),
+            "ended_at": s_meta.get("ended_at"),
+            "end_reason": s_meta.get("end_reason"),
+        })
+        try:
+            rows.extend(db.get_messages(sid))
+        except Exception as e:
+            logging.debug("get_messages failed for current lineage session %s: %s", sid, e, exc_info=True)
+
+    visible = [m for m in rows if m.get("role") in ("user", "assistant")]
+    total = len(visible)
+    truncated = total > head + tail
+    messages = visible[:head] + visible[-tail:] if truncated else visible
+
+    return json.dumps({
+        "success": True,
+        "mode": "current",
+        "scope": "current",
+        "session_id": current_session_id,
+        "lineage_session_ids": lineage_ids,
+        "lineage_session_meta": lineage_meta,
+        "session_meta": {
+            "when": _format_timestamp(meta.get("started_at")),
+            "source": meta.get("source"),
+            "model": meta.get("model"),
+            "title": meta.get("title") or None,
+        },
+        "message_count": total,
+        "truncated": truncated,
+        "bookend_start": [_shape_message(m) for m in visible[:5]],
+        "messages": [_shape_message(m) for m in messages],
+        "bookend_end": [_shape_message(m) for m in visible[-5:]],
+        "message": (
+            f"Showing current session lineage ({len(lineage_ids)} session(s)); "
+            "no keyword search was performed."
+        ),
+    }, ensure_ascii=False)
+
+
 def _list_recent_sessions(
     db,
     limit: int,
@@ -853,7 +929,7 @@ def session_search(
     )
     apply_scope = _should_scope_to_current(scope, current_scope)
     mode_norm = _clean(mode).lower()
-    if mode_norm not in {"previous", "handoff"}:
+    if mode_norm not in {"current", "previous", "handoff"}:
         mode_norm = ""
 
     # Scroll shape takes precedence — explicit anchor beats any query.
@@ -894,6 +970,9 @@ def session_search(
         except (TypeError, ValueError):
             limit = 3
     limit = max(1, min(limit, 10))
+
+    if mode_norm == "current":
+        return _read_current_session(db, current_session_id=current_session_id)
 
     if mode_norm in {"previous", "handoff"}:
         return _previous_or_handoff(
@@ -954,8 +1033,14 @@ SESSION_SEARCH_SCHEMA = {
         "Search past sessions stored in the local session DB, or scroll inside one. "
         "FTS5-backed retrieval over the SQLite message store. No LLM calls — every "
         "shape returns actual messages from the DB.\n\n"
-        "FOUR CALLING SHAPES\n\n"
-        "  1) DISCOVERY — pass `query`:\n"
+        "FIVE CALLING SHAPES\n\n"
+        "  1) CURRENT — pass `mode=\"current\"`:\n"
+        "     session_search(mode=\"current\")\n"
+        "     Returns the active current-session lineage using the hidden runtime "
+        "session id. Use this for \"本会话/当前对话/这个会话开头/我们开头说的\". "
+        "This does not run FTS5 keyword search and cannot drift into older "
+        "same-chat topics.\n\n"
+        "  2) DISCOVERY — pass `query`:\n"
         "     session_search(query=\"auth refactor\", limit=3)\n"
         "     Runs FTS5, dedupes hits by session lineage, returns the top N sessions. "
         "Each result carries:\n"
@@ -970,7 +1055,7 @@ SESSION_SEARCH_SCHEMA = {
         "       - match_message_id, messages_before, messages_after\n"
         "     Bookends + window together let you reconstruct goal → match → resolution "
         "without paying for the whole transcript.\n\n"
-        "  2) SCROLL — pass `session_id` + `around_message_id`:\n"
+        "  3) SCROLL — pass `session_id` + `around_message_id`:\n"
         "     session_search(session_id=\"...\", around_message_id=12345, window=10)\n"
         "     Returns a window of ±`window` messages centered on the anchor. No FTS5, "
         "no bookends — just the slice. Use after a discovery call when you need more "
@@ -980,13 +1065,13 @@ SESSION_SEARCH_SCHEMA = {
         "       - The boundary message appears in both windows — orientation marker.\n"
         "       - When messages_before or messages_after is < window, you're at the "
         "start or end of the session.\n\n"
-        "  3) READ — pass `session_id` only (no around_message_id):\n"
+        "  4) READ — pass `session_id` only (no around_message_id):\n"
         "     session_search(session_id=\"...\", profile=\"work\")\n"
         "     Dumps the whole session by id (first 20 + last 10 messages when "
         "large). This is how you resolve an `@session:<profile>/<id>` link the "
         "user dropped into the chat: split the value on `/` into profile + id "
         "and call session_search(session_id=id, profile=profile).\n\n"
-        "  4) BROWSE — no args:\n"
+        "  5) BROWSE — no args:\n"
         "     session_search()\n"
         "     Returns recent sessions chronologically: titles, previews, timestamps. "
         "Use when the user asks \"what was I working on\" without naming a topic.\n\n"
@@ -996,10 +1081,11 @@ SESSION_SEARCH_SCHEMA = {
         "(`\"docker networking\"`), boolean (`python NOT java`), or prefix wildcards "
         "(`deploy*`).\n\n"
         "WHEN TO USE\n\n"
-        "  Reach for this on any \"what did we do about X\" / \"where did we leave Y\" / "
-        "\"find the session where Z\" question — before gh, web search, or filesystem "
-        "inspection. The session DB carries what was said when; external tools show "
-        "current world state."
+        "  Use mode='current' for the active conversation itself. Reach for discovery "
+        "only on cross-session questions like \"what did we do about X\" / "
+        "\"where did we leave Y\" / \"find the session where Z\" question — before "
+        "gh, web search, or filesystem inspection. The session DB carries what was "
+        "said when; external tools show current world state."
     ),
     "parameters": {
         "type": "object",
@@ -1036,12 +1122,14 @@ SESSION_SEARCH_SCHEMA = {
             },
             "mode": {
                 "type": "string",
-                "enum": ["previous", "handoff"],
+                "enum": ["current", "previous", "handoff"],
                 "description": (
-                    "Dedicated previous-session shape. Use 'previous' or 'handoff' "
+                    "Dedicated non-discovery shapes. Use 'current' when the user "
+                    "asks about the active conversation itself, e.g. '本会话开头', "
+                    "'这个会话', or '我们开头说的'. Use 'previous' or 'handoff' "
                     "when the user asks for the immediately previous/current-chat "
-                    "conversation, e.g. '刚才那个会话' or '交接信息'. This does not do "
-                    "keyword search or global fallback."
+                    "conversation, e.g. '刚才那个会话' or '交接信息'. These modes do "
+                    "not do keyword search or global fallback."
                 ),
             },
             "scope": {
