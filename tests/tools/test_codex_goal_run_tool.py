@@ -353,6 +353,178 @@ def test_review_candidate_default_is_disabled_and_does_not_run_tui_or_codex_pref
     assert result["review"]["blockers"] == ["review_runner_disabled"]
 
 
+def test_review_candidate_real_review_requires_authorization_before_runner_call(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+    calls = []
+
+    def forbidden_runner(*, review_packet):
+        calls.append(review_packet)
+        raise AssertionError("unauthorized review_candidate must not call real review runner")
+
+    monkeypatch.setattr(tool, "_REAL_CANDIDATE_REVIEW_RUNNER", forbidden_runner, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7c",
+        review_runner_enabled=True,
+        allow_real_review=False,
+    )
+
+    assert result["status"] == "real_review_not_authorized"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "run_manual_or_guarded_review"
+    assert result["completion_trusted"] is False
+    assert result["review"]["blockers"] == ["real_review_not_authorized"]
+    assert calls == []
+
+
+def test_review_candidate_real_review_missing_runner_is_fail_closed(tmp_path):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7c",
+        review_runner_enabled=True,
+        allow_real_review=True,
+    )
+
+    assert result["status"] == "review_runner_missing"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "run_manual_or_guarded_review"
+    assert result["completion_trusted"] is False
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "review_candidate_runner_missing"}
+    assert result["review"]["blockers"] == ["missing_review_runner"]
+
+
+def test_review_candidate_authorized_fake_runner_receives_review_packet_only(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "README.md").write_text("hello\ntracked change\n", encoding="utf-8")
+    (repo / "notes.md").write_text("untracked candidate note\n", encoding="utf-8")
+    calls = []
+
+    def fake_runner(*, review_packet):
+        calls.append(review_packet)
+        return {"status": "passed", "must_fix": [], "blockers": [], "suggestions": []}
+
+    monkeypatch.setattr(tool, "_REAL_CANDIDATE_REVIEW_RUNNER", fake_runner, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7c",
+        objective="Run authorized fake review runner",
+        review_runner_enabled=True,
+        allow_real_review=True,
+    )
+
+    assert result["status"] == "review_passed"
+    assert result["classification"] == "reviewed"
+    assert result["candidate_disposition"] == "needs_verification"
+    assert result["completion_trusted"] is False
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "review_candidate_runner"}
+    assert len(calls) == 1
+    packet = calls[0]
+    assert packet["stage_id"] == "slice-7c"
+    assert packet["objective"] == "Run authorized fake review runner"
+    assert packet["candidate_evidence"]["changed_files"] == ["README.md"]
+    assert packet["candidate_evidence"]["untracked_files"] == ["notes.md"]
+    assert "raw_tui_log" not in packet
+    assert "raw_log" not in packet
+    assert result["review_handoff"]["review_packet"] == packet
+
+
+def test_review_candidate_clean_repo_does_not_call_authorized_runner(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    calls = []
+
+    def forbidden_runner(*, review_packet):
+        calls.append(review_packet)
+        raise AssertionError("clean candidate review must not call runner")
+
+    monkeypatch.setattr(tool, "_REAL_CANDIDATE_REVIEW_RUNNER", forbidden_runner, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7c",
+        review_runner_enabled=True,
+        allow_real_review=True,
+    )
+
+    assert result["status"] == "no_candidate_changes"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "planning_only"
+    assert result["next_action"] == "inspect_no_candidate_changes"
+    assert result["completion_trusted"] is False
+    assert result["preflight"]["codex"] == {"status": "not_run", "reason": "review_candidate_no_candidate_changes"}
+    assert calls == []
+
+
+def test_review_candidate_runner_exception_is_review_unavailable(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    (repo / "candidate.md").write_text("candidate note\n", encoding="utf-8")
+
+    def failing_runner(*, review_packet):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(tool, "_REAL_CANDIDATE_REVIEW_RUNNER", failing_runner, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7c",
+        review_runner_enabled=True,
+        allow_real_review=True,
+    )
+
+    assert result["status"] == "review_unavailable"
+    assert result["classification"] == "blocked"
+    assert result["candidate_disposition"] == "needs_review"
+    assert result["next_action"] == "retry_with_bounded_packet_or_manual_review"
+    assert result["completion_trusted"] is False
+    assert result["review"]["status"] == "review_unavailable"
+    assert result["review"]["reason"] == "review_runner_exception"
+    assert result["review"]["blockers"] == ["review_runner_exception"]
+
+
+def test_review_candidate_runner_receives_bounded_packet(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    long_objective = "x" * (tool._STRING_LIMIT + 100)
+    for index in range(tool._LIST_LIMIT + 5):
+        (repo / f"candidate-{index:03d}.md").write_text(f"candidate {index}\n", encoding="utf-8")
+    calls = []
+
+    def fake_runner(*, review_packet):
+        calls.append(review_packet)
+        return {"status": "passed", "must_fix": [], "blockers": [], "suggestions": []}
+
+    monkeypatch.setattr(tool, "_REAL_CANDIDATE_REVIEW_RUNNER", fake_runner, raising=False)
+
+    result = _call(
+        repo,
+        mode="review_candidate",
+        stage_id="slice-7c",
+        objective=long_objective,
+        review_runner_enabled=True,
+        allow_real_review=True,
+    )
+
+    assert result["status"] == "review_passed"
+    assert len(calls) == 1
+    packet = calls[0]
+    untracked = packet["candidate_evidence"]["untracked_files"]
+    assert len(untracked) == tool._LIST_LIMIT + 1
+    assert untracked[-1] == "...[5 more]"
+    assert len(packet["objective"]) <= tool._STRING_LIMIT
+    assert packet["objective"].endswith("...[truncated]")
+
+
 def test_codex_goals_preflight_uses_features_list(monkeypatch):
     calls = []
     monkeypatch.setattr(tool.shutil, "which", lambda name: "/tmp/codex-yuna" if name == "codex-yuna" else None)

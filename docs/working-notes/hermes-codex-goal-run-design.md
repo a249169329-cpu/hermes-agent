@@ -1,6 +1,6 @@
 # `codex_goal_run` Runtime Driver Design
 
-> 状态：设计文档 / implementation plan；Slice 1-7B mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、smoke hardening、`collect_candidate` review handoff、以及 `review_candidate` replay review lane 已实现；真实 adapter 仍未接入 runtime 默认路径。
+> 状态：设计文档 / implementation plan；Slice 1-7C mock-first/replay/gated runtime skeleton、real TUI smoke runbook、一次授权 smoke、smoke hardening、`collect_candidate` review handoff、`review_candidate` replay review lane、以及真实 review runner adapter call-site 已实现；真实 review runner 仍未注入 runtime 默认路径。
 > 日期：2026-06-17
 > 关联文档：
 > - `docs/working-notes/hermes-codex-division-of-labor.md`
@@ -28,6 +28,7 @@
 | Slice 6 | `test/docs(codex): harden goal TUI smoke learnings` | 固化 smoke 经验：`Goal blocked` + candidate evidence => candidate ready；测试通过 monkeypatched `_TMP_ROOT` 不再假设 `Path.cwd()` outside `/tmp` | 否 |
 | Slice 7A | `collect_candidate` review handoff | dirty candidate worktree 可收集 tracked/staged/untracked/diff_stat/status evidence；生成 bounded `review_handoff.review_packet` | 否 |
 | Slice 7B | `review_candidate` replay review lane | 复用 candidate packet；接收 `review_replay`；分类 passed / blocked / unavailable；默认 review runner disabled | 否 |
+| Slice 7C | real review runner adapter call-site | `allow_real_review=True` 且 runner 已注入时才调用；runner 缺失 fail-closed；fake runner 只收 `review_packet` | 否 |
 
 详细对照表与 Slice 4 边界计划见：
 
@@ -740,19 +741,41 @@ git diff --check HEAD
 - `status=passed` 但含普通 blockers / `must_fix` 时仍返回 `review_blocked`；
 - 默认 disabled 与 replay path 都不触发 Codex preflight / TUI launch / TUI poll hooks。
 
-### Slice 7C（后续）：real review runner adapter call-site
+### Slice 7C：real review runner adapter call-site（已实现）
 
 功能：
 
 - 将 `review_candidate` 的 replay/fake contract 接到真实 review runner adapter 前的 fail-closed call-site；
 - 真实 runner 默认 disabled；
 - 授权前只返回 `real_review_not_authorized` / `review_runner_missing`，不执行 Codex。
+- 只有 `review_runner_enabled=True` + `allow_real_review=True` + runner 已注入时，才调用 runner；
+- clean/no-candidate path 不调用 runner；
+- runner 只接收 bounded `review_handoff.review_packet`，不接收 raw TUI log；
+- runner 异常 fail-closed 为 `review_unavailable`。
 
 测试：
 
 - unauthorized path 不调用 runner；
 - `allow_real_review=True` 但缺 runner 返回 missing；
-- fake injected runner 只接收 bounded packet，不接收 raw TUI log。
+- fake injected runner 只接收 bounded packet，不接收 raw TUI log；
+- clean repo 不调用 authorized runner；
+- runner exception 映射为 `review_unavailable`；
+- long objective / many untracked files 在进入 runner 前已 bounded。
+
+### Slice 7D（后续）：bounded packet/review guard adapter implementation
+
+功能：
+
+- 在 Slice 7C hook 后面实现真实 adapter；
+- 真实 adapter 默认 disabled，需要显式授权；
+- adapter 应调用 bounded packet / review guard，而不是 raw unbounded Codex review；
+- review unavailable 不算 pass。
+
+测试：
+
+- adapter disabled 不调用 guard；
+- fake guard 接收 packet-only prompt；
+- `aggregated_output_flood` / unusable guard output 映射为 `review_unavailable`。
 
 ## 16. 不建议首版做的事
 
@@ -797,21 +820,21 @@ git diff --check HEAD
 
 ## 19. 下一步建议
 
-若继续进入实现，下一步建议是 **Slice 7C：real review runner adapter call-site**，默认不再跑真实 TUI。
+若继续进入实现，下一步建议是 **Slice 7D：bounded packet/review guard adapter implementation**，默认不再跑真实 TUI。
 
 理由：
 
 ```text
-Slice 1-7B 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke、smoke hardening、collect_candidate review handoff 和 review_candidate replay lane。
-下一步才考虑把 review_candidate 的 fake/replay contract 接到真实 review runner adapter call-site。
+Slice 1-7C 已完成 mock/replay/disabled-wrapper/gated-runner/call-site skeleton、smoke runbook、一次授权真实 smoke、smoke hardening、collect_candidate review handoff、review_candidate replay lane 和 real review runner adapter call-site。
+下一步才考虑在 call-site 后面实现 bounded packet/review guard adapter。
 默认不再启动真实 TUI；只有用户重新明确授权时才重跑 smoke。
 ```
 
 下一阶段应停止在：
 
 ```text
-real review runner adapter call-site
-default disabled/fail-closed
+bounded packet/review guard adapter implementation
+default disabled/explicit authorization only
 do not repeat real TUI smoke
 ```
 

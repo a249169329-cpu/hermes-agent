@@ -13,6 +13,7 @@ _SUPPORTED_DIRTY_POLICY = "require-clean"
 _DRIVER = "codex_tui_goal"
 _DEFAULT_ARTIFACT_ROOT = Path("/tmp/hermes-codex-goals")
 _TMP_ROOT = Path("/tmp").resolve()
+_REAL_CANDIDATE_REVIEW_RUNNER = None
 _LIST_LIMIT = 80
 _STRING_LIMIT = 4000
 _DIRTY_PATH_LIMIT = 80
@@ -250,8 +251,16 @@ def _run_candidate_review_once(
             "completion_trusted": False,
         }
 
-    review_packet = review_handoff.get("review_packet") if isinstance(review_handoff, dict) else {}
-    review_result = review_runner(review_packet=review_packet)
+    review_packet = _bound(review_handoff.get("review_packet") if isinstance(review_handoff, dict) else {})
+    try:
+        review_result = review_runner(review_packet=review_packet)
+    except Exception:
+        return {
+            "status": "review_unavailable",
+            "reason": "review_runner_exception",
+            "blockers": ["review_runner_exception"],
+            "completion_trusted": False,
+        }
     if isinstance(review_result, dict):
         return _normalize_candidate_review_replay(review_result)
     return {
@@ -1271,21 +1280,56 @@ def codex_goal_run(args: dict[str, Any]) -> str:
             dirty=dirty,
             candidate_evidence=candidate_evidence,
         )
+        if not has_candidate_changes:
+            return _json_result(
+                _base_result(
+                    status="no_candidate_changes",
+                    mode=mode,
+                    workdir=repo,
+                    stage_id=args.get("stage_id"),
+                    preflight={
+                        "status": "no_candidate_changes",
+                        "blockers": ["no_candidate_changes"],
+                        "dirty_check": dirty,
+                        "codex": {"status": "not_run", "reason": "review_candidate_no_candidate_changes"},
+                    },
+                    classification="blocked",
+                    next_action="inspect_no_candidate_changes",
+                    candidate_disposition="planning_only",
+                    dirty_baseline_policy=dirty_policy,
+                    git_head=git_head,
+                    plan=plan,
+                    candidate_evidence=candidate_evidence,
+                    review_handoff=review_handoff,
+                    review={
+                        "status": "not_run",
+                        "blockers": ["no_candidate_changes"],
+                        "completion_trusted": False,
+                    },
+                )
+            )
         review_replay = args.get("review_replay") if isinstance(args.get("review_replay"), dict) else None
         review_runner_enabled = args.get("review_runner_enabled") is True
         allow_real_review = args.get("allow_real_review") is True
+        review_runner = _REAL_CANDIDATE_REVIEW_RUNNER
         review = _run_candidate_review_once(
             review_handoff=review_handoff,
             review_runner_enabled=review_runner_enabled,
             allow_real_review=allow_real_review,
             review_replay=review_replay,
+            review_runner=review_runner,
         )
-        if not has_candidate_changes:
-            status = "no_candidate_changes"
-            classification = "blocked"
-            next_action = "inspect_no_candidate_changes"
-            disposition = "planning_only"
-        elif review["status"] == "passed":
+        if review_replay is not None:
+            codex_reason = "review_candidate_replay"
+        elif not review_runner_enabled:
+            codex_reason = "review_candidate_disabled"
+        elif not allow_real_review:
+            codex_reason = "review_candidate_not_authorized"
+        elif review.get("status") == "review_runner_missing":
+            codex_reason = "review_candidate_runner_missing"
+        else:
+            codex_reason = "review_candidate_runner"
+        if review["status"] == "passed":
             status = "review_passed"
             classification = "reviewed"
             next_action = "run_required_verification_before_commit"
@@ -1317,13 +1361,7 @@ def codex_goal_run(args: dict[str, Any]) -> str:
                     "dirty_check": dirty,
                     "codex": {
                         "status": "not_run",
-                        "reason": (
-                            "review_candidate_replay"
-                            if review_replay is not None
-                            else "review_candidate_disabled"
-                            if not review_runner_enabled
-                            else "review_candidate_gated"
-                        ),
+                        "reason": codex_reason,
                     },
                 },
                 classification=classification,
