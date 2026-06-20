@@ -750,6 +750,101 @@ class TestSendUpdateNotification:
         assert "finished successfully" in sent_text
 
     @pytest.mark.asyncio
+    async def test_sends_localized_success_message_when_no_output(self, tmp_path, monkeypatch):
+        """Post-update success notifications use the configured UI language."""
+        monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending = {"platform": "telegram", "chat_id": "111", "user_id": "222"}
+        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._send_update_notification()
+
+        sent_text = mock_adapter.send.call_args[0][1]
+        assert "Hermes update finished" not in sent_text
+        assert "Hermes 更新已完成" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_sends_localized_failure_message_when_no_output(self, tmp_path, monkeypatch):
+        """Post-update failure notifications use the configured UI language."""
+        monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending = {"platform": "telegram", "chat_id": "111", "user_id": "222"}
+        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+        (hermes_home / ".update_exit_code").write_text("1")
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._send_update_notification()
+
+        sent_text = mock_adapter.send.call_args[0][1]
+        assert "Hermes update failed" not in sent_text
+        assert "Hermes 更新失败" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_streaming_watcher_sends_localized_completion(self, tmp_path, monkeypatch):
+        """The streaming /update watcher localizes its final completion message."""
+        monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram", "chat_id": "111", "user_id": "222",
+        }))
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        mock_adapter = MagicMock()
+        mock_adapter.send = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(poll_interval=0.001, stream_interval=999, timeout=0.05)
+
+        sent_texts = [call.args[1] for call in mock_adapter.send.call_args_list]
+        assert any("Hermes 更新已完成" in text for text in sent_texts)
+        assert all("Hermes update finished" not in text for text in sent_texts)
+
+    @pytest.mark.asyncio
+    async def test_streaming_watcher_sends_localized_prompt_fallback(self, tmp_path, monkeypatch):
+        """Fallback text for update prompts uses the configured UI language."""
+        monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram", "chat_id": "111", "user_id": "222",
+        }))
+        (hermes_home / ".update_prompt.json").write_text(json.dumps({
+            "prompt": "Apply update?", "default": "yes",
+        }))
+
+        mock_adapter = MagicMock()
+        mock_adapter.typed_command_prefix = "/"
+        mock_adapter.send = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(poll_interval=0.001, stream_interval=999, timeout=0.005)
+
+        sent_texts = [call.args[1] for call in mock_adapter.send.call_args_list]
+        assert any("更新需要你确认" in text for text in sent_texts)
+        assert all("Update needs your input" not in text for text in sent_texts)
+
+    @pytest.mark.asyncio
     async def test_cleans_up_files_after_notification(self, tmp_path):
         """Both marker and output files are deleted after notification."""
         runner = _make_runner()

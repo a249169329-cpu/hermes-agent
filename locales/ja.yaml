@@ -216,6 +216,7 @@ gateway:
   restart:
     in_progress:           "⏳ ゲートウェイの再起動はすでに進行中です..."
     restarting:            "♻ ゲートウェイを再起動しています。60 秒以内に通知が届かない場合は、コンソールで `hermes gateway restart` を実行してください。"
+    restarted_successfully: "♻ Gateway restarted successfully. Your session continues."
 
   resume:
     db_unavailable:        "セッションデータベースは利用できません。"
@@ -313,6 +314,15 @@ Future messages in this room will use that transcript until `/reset` or another 
     hermes_cmd_not_found:    "✗ `hermes` コマンドが見つかりません。Hermes は実行中ですが、更新コマンドは PATH 上にも現在の Python インタープリタ経由でも実行可能ファイルを見つけられませんでした。ターミナルで `hermes update` を手動で実行してみてください。"
     start_failed:            "✗ 更新の開始に失敗しました: {error}"
     starting:                "⚕ Hermes の更新を開始しています… 進捗をここにストリーミングします。"
+    finished:                "✅ Hermes update finished."
+    failed_exit_code:        "❌ Hermes update failed (exit code {exit_code})."
+    prompt_default_hint:     " (default: {default})"
+    prompt_fallback:         "⚕ **Update needs your input:**\n\n{prompt}{default_hint}\n\nReply `{prefix}approve` (yes) or `{prefix}deny` (no), or type your answer directly."
+    timed_out:               "❌ Hermes update timed out after 30 minutes."
+    finished_with_output:    "✅ Hermes update finished.\n\n```\n{output}\n```"
+    failed_with_output:      "❌ Hermes update failed.\n\n```\n{output}\n```"
+    finished_successfully:   "✅ Hermes update finished successfully."
+    failed_generic:          "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
 
   usage:
     rate_limits:              "⏱️ **レート制限:** {state}"

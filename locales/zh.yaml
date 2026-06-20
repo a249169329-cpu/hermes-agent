@@ -216,6 +216,7 @@ gateway:
   restart:
     in_progress:           "⏳ 网关重启已在进行中……"
     restarting:            "♻ 正在重启网关。如果 60 秒内没有收到通知，请在控制台运行 `hermes gateway restart` 重启。"
+    restarted_successfully: "♻ 网关已重启成功。你的会话会继续。"
 
   resume:
     db_unavailable:        "会话数据库不可用。"
@@ -313,6 +314,15 @@ Future messages in this room will use that transcript until `/reset` or another 
     hermes_cmd_not_found:    "✗ 无法找到 `hermes` 命令。Hermes 正在运行，但更新命令无法在 PATH 上或通过当前 Python 解释器找到可执行文件。请尝试在终端中手动运行 `hermes update`。"
     start_failed:            "✗ 启动更新失败：{error}"
     starting:                "⚕ 正在启动 Hermes 更新…… 进度将在此处显示。"
+    finished:                "✅ Hermes 更新已完成。"
+    failed_exit_code:        "❌ Hermes 更新失败（退出码 {exit_code}）。"
+    prompt_default_hint:     "（默认：{default}）"
+    prompt_fallback:         "⚕ **更新需要你确认：**\n\n{prompt}{default_hint}\n\n回复 `{prefix}approve`（是）或 `{prefix}deny`（否），或直接输入你的答案。"
+    timed_out:               "❌ Hermes 更新超时（超过 30 分钟）。"
+    finished_with_output:    "✅ Hermes 更新已完成。\n\n```\n{output}\n```"
+    failed_with_output:      "❌ Hermes 更新失败。\n\n```\n{output}\n```"
+    finished_successfully:   "✅ Hermes 更新已完成。"
+    failed_generic:          "❌ Hermes 更新失败。请检查 gateway 日志，或在终端手动运行 `hermes update`。"
 
   usage:
     rate_limits:              "⏱️ **速率限制：** {state}"

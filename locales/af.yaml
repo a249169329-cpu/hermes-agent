@@ -216,6 +216,7 @@ gateway:
   restart:
     in_progress:           "⏳ Gateway-herbegin reeds aan die gang..."
     restarting:            "♻ Herbegin van gateway. As jy nie binne 60 sekondes in kennis gestel word nie, herbegin vanaf die konsole met `hermes gateway restart`."
+    restarted_successfully: "♻ Gateway restarted successfully. Your session continues."
 
   resume:
     db_unavailable:        "Sessie-databasis is nie beskikbaar nie."
@@ -313,6 +314,15 @@ Future messages in this room will use that transcript until `/reset` or another 
     hermes_cmd_not_found:    "✗ Kon nie die `hermes`-opdrag vind nie. Hermes loop, maar die opdateeropdrag kon nie die uitvoerbare lêer op PATH of via die huidige Python-vertolker vind nie. Probeer `hermes update` met die hand in jou terminale uitvoer."
     start_failed:            "✗ Kon nie opdatering begin nie: {error}"
     starting:                "⚕ Begin Hermes-opdatering… Ek sal vordering hier stroom."
+    finished:                "✅ Hermes update finished."
+    failed_exit_code:        "❌ Hermes update failed (exit code {exit_code})."
+    prompt_default_hint:     " (default: {default})"
+    prompt_fallback:         "⚕ **Update needs your input:**\n\n{prompt}{default_hint}\n\nReply `{prefix}approve` (yes) or `{prefix}deny` (no), or type your answer directly."
+    timed_out:               "❌ Hermes update timed out after 30 minutes."
+    finished_with_output:    "✅ Hermes update finished.\n\n```\n{output}\n```"
+    failed_with_output:      "❌ Hermes update failed.\n\n```\n{output}\n```"
+    finished_successfully:   "✅ Hermes update finished successfully."
+    failed_generic:          "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
 
   usage:
     rate_limits:              "⏱️ **Tariefperke:** {state}"

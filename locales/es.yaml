@@ -216,6 +216,7 @@ gateway:
   restart:
     in_progress:           "⏳ El reinicio del gateway ya está en curso..."
     restarting:            "♻ Reiniciando el gateway. Si no recibes notificación en 60 segundos, reinicia desde la consola con `hermes gateway restart`."
+    restarted_successfully: "♻ Gateway restarted successfully. Your session continues."
 
   resume:
     db_unavailable:        "Base de datos de sesiones no disponible."
@@ -313,6 +314,15 @@ Future messages in this room will use that transcript until `/reset` or another 
     hermes_cmd_not_found:    "✗ No se pudo localizar el comando `hermes`. Hermes está en ejecución, pero el comando de actualización no encontró el ejecutable en PATH ni a través del intérprete de Python actual. Intenta ejecutar `hermes update` manualmente en tu terminal."
     start_failed:            "✗ No se pudo iniciar la actualización: {error}"
     starting:                "⚕ Iniciando la actualización de Hermes… Transmitiré el progreso aquí."
+    finished:                "✅ Hermes update finished."
+    failed_exit_code:        "❌ Hermes update failed (exit code {exit_code})."
+    prompt_default_hint:     " (default: {default})"
+    prompt_fallback:         "⚕ **Update needs your input:**\n\n{prompt}{default_hint}\n\nReply `{prefix}approve` (yes) or `{prefix}deny` (no), or type your answer directly."
+    timed_out:               "❌ Hermes update timed out after 30 minutes."
+    finished_with_output:    "✅ Hermes update finished.\n\n```\n{output}\n```"
+    failed_with_output:      "❌ Hermes update failed.\n\n```\n{output}\n```"
+    finished_successfully:   "✅ Hermes update finished successfully."
+    failed_generic:          "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
 
   usage:
     rate_limits:              "⏱️ **Límites de tasa:** {state}"
