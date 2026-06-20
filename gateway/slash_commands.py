@@ -2384,7 +2384,12 @@ class GatewaySlashCommandsMixin:
                 example = t("gateway.footer.example_line", preview=preview)
         return t("gateway.footer.saved", state=state, example=example)
 
-    async def _handle_compress_command(self, event: MessageEvent) -> str:
+    async def _handle_compress_command(
+        self,
+        event: MessageEvent,
+        *,
+        abort_on_summary_failure: bool | None = None,
+    ) -> str:
         """Handle /compress command -- manually compress conversation context.
 
         Accepts an optional focus topic: ``/compress <focus>`` guides the
@@ -2401,7 +2406,14 @@ class GatewaySlashCommandsMixin:
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
 
+        def _set_manual_compress_result(**state):
+            try:
+                self._last_manual_compress_result = dict(state)
+            except Exception:
+                pass
+
         if not history or len(history) < 4:
+            _set_manual_compress_result(summary_aborted=False, failed=True, error="not_enough_history")
             return t("gateway.compress.not_enough")
 
         # Parse args: either a focus topic (full compress) or the
@@ -2425,6 +2437,7 @@ class GatewaySlashCommandsMixin:
                 session_key=session_key,
             )
             if not runtime_kwargs.get("api_key"):
+                _set_manual_compress_result(summary_aborted=False, failed=True, error="no_provider")
                 return t("gateway.compress.no_provider")
 
             msgs = [
@@ -2457,6 +2470,11 @@ class GatewaySlashCommandsMixin:
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
+                if abort_on_summary_failure is not None:
+                    try:
+                        tmp_agent.context_compressor.abort_on_summary_failure = bool(abort_on_summary_failure)
+                    except Exception:
+                        pass
 
                 # Estimate with system prompt + tool schemas included so the
                 # figure reflects real request pressure, not a transcript-only
@@ -2549,9 +2567,15 @@ class GatewaySlashCommandsMixin:
                         error=(_aux_fail_err or "unknown error"),
                     )
                 )
+            _set_manual_compress_result(
+                summary_aborted=_summary_aborted,
+                failed=False,
+                error=(_summary_err if _summary_aborted else None),
+            )
             return "\n".join(lines)
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
+            _set_manual_compress_result(summary_aborted=False, failed=True, error=str(e))
             return t("gateway.compress.failed", error=e)
 
     async def _handle_topic_command(self, event: MessageEvent, args: str = "") -> str:

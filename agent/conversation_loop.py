@@ -28,6 +28,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.compression_retry_gate import format_manual_compression_retry_prompt
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
@@ -72,9 +73,9 @@ INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model r
 
 
 _COMPRESSION_CIRCUIT_BREAKER_MESSAGE = (
-    "🛑 context 刚压缩恢复，本轮自动停止。\n\n"
-    "为避免继续启动 Codex、全量验证、build 或其它重任务压垮服务器，"
-    "请新开会话或回复“继续下一阶段”后再继续。"
+    "✅ 已完成压缩，本轮已暂停。\n\n"
+    "为避免压缩后立刻继续执行 Codex、全量验证、build 或其它重任务，"
+    "请重新发送刚才的问题，或回复“继续下一阶段”。"
 )
 
 _PROVIDER_ERROR_COMPRESSION_INCLUDE_STRINGS = (
@@ -213,13 +214,18 @@ def _should_halt_after_auto_compression(
         return False
     recovery_stage = getattr(agent.context_compressor, "_last_summary_recovery_stage", None)
     summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
+    manual_retry_pending = bool(
+        getattr(agent, "manual_compression_retry_on_summary_failure", False)
+        and getattr(agent.context_compressor, "_last_compress_aborted", False)
+    )
     compressed_len = len(getattr(agent, "_session_messages", []) or [])
     # Most call sites update ``messages`` before assigning _session_messages;
     # callers therefore pass ``original_len`` and we check the current local
     # length separately at the call site.  ``compressed_len`` is only a fallback
     # for tests/alternate callers that already assigned the session messages.
     return bool(
-        context_reduced
+        manual_retry_pending
+        or context_reduced
         or recovery_stage in {"safe_retry", "chunked", "extractive_fallback"}
         or summary_error
         or (compressed_len and compressed_len < original_len)
@@ -234,17 +240,26 @@ def _halt_after_compression_circuit_breaker(
     effective_task_id: str,
 ) -> Dict[str, Any]:
     """Persist a controlled stop after compression recovery and return."""
-    final_response = _COMPRESSION_CIRCUIT_BREAKER_MESSAGE
+    manual_retry_pending = bool(
+        getattr(agent, "manual_compression_retry_on_summary_failure", False)
+        and getattr(agent.context_compressor, "_last_compress_aborted", False)
+    )
+    summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
+    if manual_retry_pending:
+        final_response = format_manual_compression_retry_prompt(summary_error)
+    else:
+        final_response = _COMPRESSION_CIRCUIT_BREAKER_MESSAGE
     messages.append({"role": "assistant", "content": final_response})
     agent._cleanup_task_resources(effective_task_id)
     agent._persist_session(messages, conversation_history)
     logger.warning(
-        "Compression circuit breaker halted turn: platform=%s session=%s messages=%d",
+        "Compression circuit breaker halted turn: platform=%s session=%s messages=%d manual_retry=%s",
         getattr(agent, "platform", None),
         getattr(agent, "session_id", None) or "none",
         len(messages),
+        manual_retry_pending,
     )
-    return {
+    result = {
         "final_response": final_response,
         "messages": messages,
         "api_calls": api_call_count,
@@ -252,8 +267,12 @@ def _halt_after_compression_circuit_breaker(
         "partial": True,
         "failed": False,
         "compression_circuit_breaker": True,
-        "turn_exit_reason": "compression_circuit_breaker",
+        "turn_exit_reason": "compression_manual_retry_pending" if manual_retry_pending else "compression_circuit_breaker",
     }
+    if manual_retry_pending:
+        result["compression_manual_retry_pending"] = True
+        result["compression_summary_error"] = summary_error or "unknown error"
+    return result
 
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
@@ -2927,6 +2946,19 @@ def run_conversation(
                     # messages to the new session, not skipping them.
                     conversation_history = None
 
+                    if _should_halt_after_auto_compression(
+                        agent,
+                        original_len=original_len,
+                        context_reduced=len(messages) < original_len,
+                    ):
+                        return _halt_after_compression_circuit_breaker(
+                            agent,
+                            messages,
+                            conversation_history,
+                            api_call_count,
+                            effective_task_id,
+                        )
+
                     if len(messages) < original_len:
                         if _should_halt_after_auto_compression(
                             agent,
@@ -3095,6 +3127,19 @@ def run_conversation(
                     # messages to the new session, not skipping them.
                     conversation_history = None
 
+                    if _should_halt_after_auto_compression(
+                        agent,
+                        original_len=original_len,
+                        context_reduced=(len(messages) < original_len or bool(new_ctx and new_ctx < old_ctx)),
+                    ):
+                        return _halt_after_compression_circuit_breaker(
+                            agent,
+                            messages,
+                            conversation_history,
+                            api_call_count,
+                            effective_task_id,
+                        )
+
                     if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
                         if _should_halt_after_auto_compression(
                             agent,
@@ -3160,6 +3205,18 @@ def run_conversation(
                     # history reference so persistence writes the compressed
                     # transcript instead of skipping it by length.
                     conversation_history = None
+                    if _should_halt_after_auto_compression(
+                        agent,
+                        original_len=original_len,
+                        context_reduced=len(messages) < original_len,
+                    ):
+                        return _halt_after_compression_circuit_breaker(
+                            agent,
+                            messages,
+                            conversation_history,
+                            api_call_count,
+                            effective_task_id,
+                        )
                     if len(messages) < original_len:
                         if _should_halt_after_auto_compression(
                             agent,

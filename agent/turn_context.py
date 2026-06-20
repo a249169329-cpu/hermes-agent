@@ -323,6 +323,9 @@ def build_turn_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
+                if getattr(_compressor, "_last_compress_aborted", False):
+                    agent._preflight_compression_halt_original_len = _orig_len
+                    break
                 if len(messages) >= _orig_len:
                     break  # Cannot compress further
                 conversation_history = None

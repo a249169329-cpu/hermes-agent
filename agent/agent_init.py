@@ -1309,6 +1309,15 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
+    compression_manual_retry_on_summary_failure = str(
+        _compression_cfg.get("manual_retry_on_summary_failure", False)
+    ).strip().lower() in {"true", "1", "yes", "on"}
+    if compression_manual_retry_on_summary_failure:
+        # Manual retry mode must not silently insert deterministic fallback.
+        # Abort the compression attempt first so the gateway can ask the user
+        # whether to retry, fallback, or stop.
+        compression_abort_on_summary_failure = True
+    agent.manual_compression_retry_on_summary_failure = compression_manual_retry_on_summary_failure
     compression_wall_clock_cap_seconds = _compression_cfg.get(
         "wall_clock_cap_seconds", 0
     )

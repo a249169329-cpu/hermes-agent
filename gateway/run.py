@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import copy
 import dataclasses
 import inspect
 import json
@@ -53,6 +54,11 @@ from typing import Dict, Optional, Any, List, Union
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
+from agent.compression_retry_gate import (
+    format_manual_compression_retry_prompt,
+    make_pending_manual_compression_retry,
+    parse_manual_compression_retry_choice,
+)
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
@@ -8044,6 +8050,146 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _handle_pending_compression_retry_choice(self, event, source, session_entry, session_key: str):
+        """Handle retry/fallback/stop replies for a pending compression failure."""
+        pending = getattr(session_entry, "compression_retry_pending", None)
+        if not pending:
+            return None
+
+        choice = parse_manual_compression_retry_choice(getattr(event, "text", "") or "")
+        error = str(pending.get("error") or "unknown error") if isinstance(pending, dict) else "unknown error"
+        attempts = int(pending.get("attempts", 0) or 0) if isinstance(pending, dict) else 0
+        max_attempts = int(pending.get("max_attempts", 3) or 3) if isinstance(pending, dict) else 3
+
+        def _save_pending(value):
+            session_entry.compression_retry_pending = value
+            try:
+                self.session_store._save()
+            except Exception:
+                logger.debug("Failed to persist compression retry pending state", exc_info=True)
+
+        def _compress_command_event():
+            """Run /compress with no focus args for plain retry/fallback replies."""
+            try:
+                return dataclasses.replace(event, text="/compress")
+            except Exception:
+                try:
+                    cloned = copy.copy(event)
+                    cloned.text = "/compress"
+                    return cloned
+                except Exception:
+                    return event
+
+        def _manual_compress_result_state():
+            state = getattr(self, "_last_manual_compress_result", None)
+            return state if isinstance(state, dict) else {}
+
+        def _clear_manual_compress_result_state():
+            try:
+                self._last_manual_compress_result = None
+            except Exception:
+                pass
+
+        if choice is None:
+            return (
+                "请先回复：重试 / 不重试 / 停止。\n\n"
+                + format_manual_compression_retry_prompt(
+                    error,
+                    attempts=attempts,
+                    max_attempts=max_attempts,
+                )
+            )
+
+        if choice == "stop":
+            _save_pending(None)
+            return "已停止：本轮不压缩、不继续大上下文请求。建议 /new，或修好 auxiliary.compression 认证后再试。"
+
+        if choice == "fallback":
+            _clear_manual_compress_result_state()
+            result = await self._handle_compress_command(
+                _compress_command_event(),
+                abort_on_summary_failure=False,
+            )
+            state = _manual_compress_result_state()
+            if not state:
+                missing_state_error = "missing_structured_compression_state"
+                _save_pending(
+                    make_pending_manual_compression_retry(
+                        missing_state_error,
+                        attempts=attempts,
+                        max_attempts=max_attempts,
+                    )
+                )
+                return (
+                    f"{result}\n\n降级压缩未返回结构化状态，仍未继续发送大上下文请求。\n\n"
+                    + format_manual_compression_retry_prompt(
+                        missing_state_error,
+                        attempts=attempts,
+                        max_attempts=max_attempts,
+                    )
+                )
+            if state.get("failed") or state.get("summary_aborted"):
+                _save_pending(
+                    make_pending_manual_compression_retry(
+                        str(state.get("error") or error),
+                        attempts=attempts,
+                        max_attempts=max_attempts,
+                    )
+                )
+                return (
+                    f"{result}\n\n降级压缩未成功，仍未继续发送大上下文请求。\n\n"
+                    + format_manual_compression_retry_prompt(
+                        str(state.get("error") or error),
+                        attempts=attempts,
+                        max_attempts=max_attempts,
+                    )
+                )
+            _save_pending(None)
+            return result
+
+        # choice == "retry"
+        if attempts >= max_attempts:
+            return (
+                f"已达到重试上限 {attempts}/{max_attempts}。建议回复：不重试（走本地 fallback）/ 停止 / 修 auth 后再试。"
+            )
+        _clear_manual_compress_result_state()
+        result = await self._handle_compress_command(
+            _compress_command_event(),
+            abort_on_summary_failure=True,
+        )
+        state = _manual_compress_result_state()
+        aborted = bool(state.get("summary_aborted"))
+        failed = bool(state.get("failed"))
+        retry_error = str(state.get("error") or error)
+        if not state:
+            aborted = True
+            retry_error = "missing_structured_compression_state"
+        if aborted or failed:
+            attempts += 1
+            _save_pending(
+                make_pending_manual_compression_retry(
+                    retry_error,
+                    attempts=attempts,
+                    max_attempts=max_attempts,
+                )
+            )
+            if attempts >= max_attempts:
+                return (
+                    f"{result}\n\n已重试 {attempts}/{max_attempts} 次仍失败。建议回复：不重试（走本地 fallback）/ 停止 / 修 auth 后再试。"
+                )
+            return (
+                f"{result}\n\n仍未压缩成功。"
+                + "\n\n"
+                + format_manual_compression_retry_prompt(
+                    retry_error,
+                    attempts=attempts,
+                    max_attempts=max_attempts,
+                )
+            )
+
+        _save_pending(None)
+        return result
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -8073,6 +8219,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        _pending_compression_reply = await self._handle_pending_compression_retry_choice(
+            event,
+            source,
+            session_entry,
+            session_key,
+        )
+        if _pending_compression_reply is not None:
+            return _pending_compression_reply
         self._cache_session_source(session_key, source)
         if self._is_telegram_topic_lane(source):
             try:
@@ -8754,6 +8908,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            if agent_result.get("compression_manual_retry_pending"):
+                _summary_error = agent_result.get("compression_summary_error") or "unknown error"
+                session_entry.compression_retry_pending = make_pending_manual_compression_retry(
+                    _summary_error,
+                    attempts=0,
+                    max_attempts=3,
+                )
+                try:
+                    self.session_store._save()
+                except Exception:
+                    logger.debug("Failed to persist compression retry pending state", exc_info=True)
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -14845,6 +15010,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "interrupt_message": result.get("interrupt_message"),
                     "error": result.get("error"),
                     "compression_exhausted": result.get("compression_exhausted", False),
+                    "compression_manual_retry_pending": result.get("compression_manual_retry_pending", False),
+                    "compression_summary_error": result.get("compression_summary_error"),
                     "tools": tools_holder[0] or [],
                     "history_offset": _effective_history_offset,
                     "session_id": effective_session_id,
@@ -14955,6 +15122,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "compression_manual_retry_pending": result.get("compression_manual_retry_pending", False),
+                "compression_summary_error": result.get("compression_summary_error"),
             }
         
         # Start progress message sender if enabled

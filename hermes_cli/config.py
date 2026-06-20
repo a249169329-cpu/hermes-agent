@@ -1165,6 +1165,10 @@ DEFAULT_CONFIG = {
                                       # Default False matches historical behavior; set to
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.
+        "manual_retry_on_summary_failure": False,  # When True, summary failure
+                                      # implies abort_on_summary_failure and gateway
+                                      # sessions ask the user to reply 重试 / 不重试
+                                      # / 停止 instead of silently fallback-compressing.
         "wall_clock_cap_seconds": 0,  # Optional end-to-end compression LLM cap.
                                       # 0/false/missing/invalid disables. When enabled,
                                       # each summary LLM call gets timeout=min(aux timeout,

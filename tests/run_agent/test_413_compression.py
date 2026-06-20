@@ -637,7 +637,8 @@ class TestHTTP413Compression:
         agent.client.chat.completions.create.assert_called_once()
         assert result["compression_circuit_breaker"] is True
         assert result["completed"] is False
-        assert "context 刚压缩恢复" in result["final_response"]
+        assert "已完成压缩" in result["final_response"]
+        assert "重新发送刚才的问题" in result["final_response"]
 
     def test_413_cannot_compress_further(self, agent):
         """When compression can't reduce messages, return partial result."""
@@ -688,7 +689,8 @@ class TestHTTP413Compression:
         assert agent.client.chat.completions.create.call_count == 1
         assert result["compression_circuit_breaker"] is True
         assert result["completed"] is False
-        assert "context 刚压缩恢复" in result["final_response"]
+        assert "已完成压缩" in result["final_response"]
+        assert "重新发送刚才的问题" in result["final_response"]
         assert "Codex" in result["final_response"]
 
 
