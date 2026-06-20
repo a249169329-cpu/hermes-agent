@@ -78,14 +78,27 @@ def test_postprocess_maps_ssh_cache_path_without_active_env(monkeypatch, tmp_pat
     assert result["agent_visible_image"] == "~/.hermes/cache/images/first-call.png"
 
 
-def test_postprocess_leaves_remote_image_urls_unchanged(monkeypatch):
+def test_postprocess_records_remote_image_url_without_rewriting_image(monkeypatch, tmp_path):
     from tools import image_generation_tool
+    from tools.artifact_ledger import ArtifactLedger, default_artifact_ledger_path
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(image_generation_tool, "_active_terminal_env", lambda task_id: None)
 
     raw = json.dumps({"success": True, "image": "https://example.com/image.png"})
+    result = json.loads(image_generation_tool._postprocess_image_generate_result(raw))
 
-    assert image_generation_tool._postprocess_image_generate_result(raw) == raw
+    assert result["image"] == "https://example.com/image.png"
+    assert result["artifact_id"].startswith("artifact_")
+
+    records = ArtifactLedger(default_artifact_ledger_path()).read_all()
+    assert len(records) == 1
+    [record] = records
+    assert record.artifact_id == result["artifact_id"]
+    assert record.source_tool == "image_generate"
+    assert record.output_url == "https://example.com/image.png"
+    assert record.output_path is None
+    assert record.verification == {"remote": True}
 
 
 def test_handle_image_generate_postprocesses_plugin_result(monkeypatch, tmp_path):
