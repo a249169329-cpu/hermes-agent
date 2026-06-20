@@ -3763,6 +3763,80 @@ class TestMCPBuiltinCollisionGuard:
         _servers.pop("srv", None)
 
 
+class TestMCPSideEffectMetadata:
+    """MCP dynamic tools declare runtime side-effect metadata."""
+
+    def test_mcp_tool_without_readonly_annotation_requires_runtime_authorization(self):
+        """Unknown MCP tools fail closed as delegated external side effects."""
+        from tools.registry import ToolRegistry
+        from tools.mcp_tool import _discover_and_register_server, _servers, MCPServerTask
+        from tools.side_effect_policy import requires_runtime_authorization
+
+        mock_registry = ToolRegistry()
+        mock_tools = [_make_mcp_tool("create_issue", "Create a GitHub issue")]
+        mock_session = MagicMock()
+
+        async def fake_connect(name, config):
+            server = MCPServerTask(name)
+            server.session = mock_session
+            server._tools = mock_tools
+            return server
+
+        with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.registry.registry", mock_registry), \
+             patch("tools.side_effect_policy.registry", mock_registry):
+            registered = asyncio.run(
+                _discover_and_register_server("github", {"command": "test", "args": []})
+            )
+
+            assert "mcp_github_create_issue" in registered
+            entry = mock_registry.get_entry("mcp_github_create_issue")
+            assert entry.side_effects["class"] == "external_mcp_tool"
+            assert entry.side_effects["may_modify_remote_state"] is True
+            assert entry.side_effects["risk"] == "delegated_external_tool"
+            assert requires_runtime_authorization("mcp_github_create_issue", {}) is True
+
+        _servers.pop("github", None)
+
+    def test_mcp_readonly_annotation_does_not_require_runtime_authorization(self):
+        """MCP tools explicitly marked read-only are not treated as mutating."""
+        from tools.registry import ToolRegistry
+        from tools.mcp_tool import _discover_and_register_server, _servers, MCPServerTask
+        from tools.side_effect_policy import requires_runtime_authorization
+
+        mock_registry = ToolRegistry()
+        search_tool = _make_mcp_tool("search_docs", "Search project docs")
+        search_tool.annotations = SimpleNamespace(
+            readOnlyHint=True,
+            destructiveHint=False,
+            openWorldHint=True,
+        )
+        mock_session = MagicMock()
+
+        async def fake_connect(name, config):
+            server = MCPServerTask(name)
+            server.session = mock_session
+            server._tools = [search_tool]
+            return server
+
+        with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.registry.registry", mock_registry), \
+             patch("tools.side_effect_policy.registry", mock_registry):
+            registered = asyncio.run(
+                _discover_and_register_server("docs", {"command": "test", "args": []})
+            )
+
+            assert "mcp_docs_search_docs" in registered
+            entry = mock_registry.get_entry("mcp_docs_search_docs")
+            assert entry.side_effects["class"] == "external_mcp_tool"
+            assert entry.side_effects["may_access_network"] is True
+            assert entry.side_effects["may_modify_remote_state"] is False
+            assert entry.side_effects["risk"] == "external_api_call"
+            assert requires_runtime_authorization("mcp_docs_search_docs", {}) is False
+
+        _servers.pop("docs", None)
+
+
 # ---------------------------------------------------------------------------
 # sanitize_mcp_name_component
 # ---------------------------------------------------------------------------

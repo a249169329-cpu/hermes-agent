@@ -94,6 +94,9 @@ def requires_runtime_authorization(tool_name: str, args: dict[str, Any] | None =
         action = str((args or {}).get("action") or "").strip().lower()
         return action in _SPOTIFY_MUTATING_ACTIONS_BY_TOOL.get(tool_name, set())
 
+    if effect_class == "external_mcp_tool":
+        return bool(side_effects.get("may_modify_remote_state")) or risk in _RUNTIME_AUTH_RISKS
+
     if effect_class in _RUNTIME_AUTH_CLASSES or risk in _RUNTIME_AUTH_RISKS:
         return True
     if any(bool(side_effects.get(flag)) for flag in _RUNTIME_AUTH_FLAGS):

@@ -3491,6 +3491,48 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
+def _mcp_annotation_bool(mcp_tool: Any, name: str) -> bool | None:
+    """Return an MCP Tool annotation bool when present.
+
+    MCP SDK versions may expose annotations as a pydantic model, dataclass-like
+    object, or plain dict in tests.  Missing annotations return None so callers
+    can fail closed for third-party tools.
+    """
+    annotations = getattr(mcp_tool, "annotations", None)
+    if annotations is None:
+        return None
+    if isinstance(annotations, dict):
+        value = annotations.get(name)
+    else:
+        value = getattr(annotations, name, None)
+    return value if isinstance(value, bool) else None
+
+
+def _mcp_tool_side_effects(mcp_tool: Any) -> dict[str, Any]:
+    """Build governance metadata for a discovered MCP tool.
+
+    Unknown MCP tools fail closed because they delegate to arbitrary external
+    servers.  Tools explicitly marked read-only by MCP annotations still carry
+    network/delegation metadata, but do not require runtime side-effect auth.
+    """
+    read_only = _mcp_annotation_bool(mcp_tool, "readOnlyHint")
+    destructive = _mcp_annotation_bool(mcp_tool, "destructiveHint")
+    may_modify = not (read_only is True and destructive is not True)
+    return {
+        "class": "external_mcp_tool",
+        "may_access_network": True,
+        "may_modify_remote_state": may_modify,
+        "risk": "delegated_external_tool" if may_modify else "external_api_call",
+        "scope": ["mcp_server"],
+        "mcp_annotations": {
+            "readOnlyHint": read_only,
+            "destructiveHint": destructive,
+            "openWorldHint": _mcp_annotation_bool(mcp_tool, "openWorldHint"),
+            "idempotentHint": _mcp_annotation_bool(mcp_tool, "idempotentHint"),
+        },
+    }
+
+
 def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
     """Register tools from an already-connected server into the registry.
 
@@ -3554,7 +3596,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
-            side_effects={'class': 'external_mcp_tool', 'may_access_network': True, 'may_modify_remote_state': True, 'risk': 'delegated_external_tool', 'scope': ['mcp_server']},
+            side_effects=_mcp_tool_side_effects(mcp_tool),
             artifact_outputs=[{'kind': 'mcp_result', 'lifetime': 'tool_result'}],
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
