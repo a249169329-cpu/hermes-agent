@@ -16,7 +16,6 @@ def test_session_entry_persists_pending_compression_retry_gate():
         compression_retry_pending={
             "error": "401 token invalidated",
             "attempts": 2,
-            "max_attempts": 3,
         },
     )
 
@@ -27,5 +26,4 @@ def test_session_entry_persists_pending_compression_retry_gate():
     assert restored.compression_retry_pending == {
         "error": "401 token invalidated",
         "attempts": 2,
-        "max_attempts": 3,
     }

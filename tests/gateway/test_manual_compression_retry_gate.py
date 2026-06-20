@@ -86,8 +86,29 @@ async def test_pending_compression_retry_runs_manual_compress_and_keeps_gate_on_
     assert compress_event.text == "/compress"
     assert runner._handle_compress_command.await_args.kwargs["abort_on_summary_failure"] is True
     assert entry.compression_retry_pending["attempts"] == 2
-    assert "2/3" in response
+    assert "2/3" not in response
     assert "不重试" in response
+
+
+@pytest.mark.asyncio
+async def test_pending_compression_retry_has_no_max_attempts_gate():
+    runner = _runner_with_structured_result(
+        "⚠️ 压缩已中止：429 model_cooldown。未丢弃消息。",
+        {"summary_aborted": True, "failed": False, "error": "429 model_cooldown reset_seconds=3526"},
+    )
+    entry = _entry(attempts=3)
+
+    response = await runner._handle_pending_compression_retry_choice(
+        _Event("重试"), _SOURCE, entry, entry.session_key
+    )
+
+    runner._handle_compress_command.assert_awaited_once()
+    assert entry.compression_retry_pending["attempts"] == 4
+    assert "重试上限" not in response
+    assert "4/3" not in response
+    assert "reset_seconds" not in response
+    assert "3526" not in response
+    assert "可重复重试" in response
 
 
 @pytest.mark.asyncio
@@ -104,7 +125,7 @@ async def test_pending_compression_retry_uses_structured_abort_state_not_english
 
     runner._handle_compress_command.assert_awaited_once()
     assert entry.compression_retry_pending["attempts"] == 2
-    assert "2/3" in response
+    assert "2/3" not in response
     assert "不重试" in response
 
 

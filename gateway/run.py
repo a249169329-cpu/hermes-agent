@@ -58,6 +58,7 @@ from agent.compression_retry_gate import (
     format_manual_compression_retry_prompt,
     make_pending_manual_compression_retry,
     parse_manual_compression_retry_choice,
+    sanitize_manual_compression_error,
 )
 from agent.i18n import t
 from hermes_cli.config import cfg_get
@@ -8057,9 +8058,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
 
         choice = parse_manual_compression_retry_choice(getattr(event, "text", "") or "")
-        error = str(pending.get("error") or "unknown error") if isinstance(pending, dict) else "unknown error"
+        error = sanitize_manual_compression_error(
+            pending.get("error") if isinstance(pending, dict) else "unknown error"
+        )
         attempts = int(pending.get("attempts", 0) or 0) if isinstance(pending, dict) else 0
-        max_attempts = int(pending.get("max_attempts", 3) or 3) if isinstance(pending, dict) else 3
 
         def _save_pending(value):
             session_entry.compression_retry_pending = value
@@ -8096,7 +8098,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 + format_manual_compression_retry_prompt(
                     error,
                     attempts=attempts,
-                    max_attempts=max_attempts,
                 )
             )
 
@@ -8117,7 +8118,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     make_pending_manual_compression_retry(
                         missing_state_error,
                         attempts=attempts,
-                        max_attempts=max_attempts,
                     )
                 )
                 return (
@@ -8125,7 +8125,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     + format_manual_compression_retry_prompt(
                         missing_state_error,
                         attempts=attempts,
-                        max_attempts=max_attempts,
                     )
                 )
             if state.get("failed") or state.get("summary_aborted"):
@@ -8133,7 +8132,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     make_pending_manual_compression_retry(
                         str(state.get("error") or error),
                         attempts=attempts,
-                        max_attempts=max_attempts,
                     )
                 )
                 return (
@@ -8141,17 +8139,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     + format_manual_compression_retry_prompt(
                         str(state.get("error") or error),
                         attempts=attempts,
-                        max_attempts=max_attempts,
                     )
                 )
             _save_pending(None)
             return result
 
-        # choice == "retry"
-        if attempts >= max_attempts:
-            return (
-                f"已达到重试上限 {attempts}/{max_attempts}。建议回复：不重试（走本地 fallback）/ 停止 / 修 auth 后再试。"
-            )
+        # choice == "retry" — one compression attempt per user message.
+        # There is intentionally no manual retry ceiling: the gate prevents
+        # automatic retry loops, while still letting the user retry as many
+        # times as they explicitly choose.
         _clear_manual_compress_result_state()
         result = await self._handle_compress_command(
             _compress_command_event(),
@@ -8170,20 +8166,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 make_pending_manual_compression_retry(
                     retry_error,
                     attempts=attempts,
-                    max_attempts=max_attempts,
                 )
             )
-            if attempts >= max_attempts:
-                return (
-                    f"{result}\n\n已重试 {attempts}/{max_attempts} 次仍失败。建议回复：不重试（走本地 fallback）/ 停止 / 修 auth 后再试。"
-                )
             return (
                 f"{result}\n\n仍未压缩成功。"
                 + "\n\n"
                 + format_manual_compression_retry_prompt(
                     retry_error,
                     attempts=attempts,
-                    max_attempts=max_attempts,
                 )
             )
 
@@ -8913,7 +8903,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_entry.compression_retry_pending = make_pending_manual_compression_retry(
                     _summary_error,
                     attempts=0,
-                    max_attempts=3,
                 )
                 try:
                     self.session_store._save()

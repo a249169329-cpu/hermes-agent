@@ -34,7 +34,26 @@ def test_retry_prompt_names_manual_choices_and_error():
     assert "重试" in prompt
     assert "不重试" in prompt
     assert "fallback" in prompt.lower()
-    assert "1/3" in prompt
+    assert "1/3" not in prompt
+    assert "0/3" not in prompt
+    assert "可重复重试" in prompt
+
+
+def test_retry_prompt_hides_provider_reset_countdown_fields():
+    prompt = format_manual_compression_retry_prompt(
+        "Error code: 429 - {'error': {'code': 'model_cooldown', "
+        "'message': 'All credentials cooling down', 'model': 'gpt-5.4', "
+        "'provider': 'codex', 'reset_seconds': 3526, "
+        "'reset_time': '2026-06-20T13:00:00Z'}}",
+        attempts=0,
+        max_attempts=3,
+    )
+
+    assert "model_cooldown" in prompt
+    assert "reset_seconds" not in prompt
+    assert "reset_time" not in prompt
+    assert "3526" not in prompt
+    assert "0/3" not in prompt
 
 
 @pytest.mark.parametrize(
