@@ -114,6 +114,59 @@ def test_execute_omitted_scope_does_not_infer_or_invoke_runner(tmp_path, monkeyp
     assert calls == []
 
 
+def test_verbose_hermes_task_packet_rejected_before_stage_files(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    calls = []
+
+    def fake_write_stage_files(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("stage files must not be written for unsafe task packets")
+
+    monkeypatch.setattr(tool, "_write_stage_files", fake_write_stage_files)
+    verbose_task = "\n".join([
+        "技能检查点：已加载 hermes-agent/codex。",
+        "MEMORY (your personal notes) [99%]",
+        "USER PROFILE (who the user is)",
+        "准备执行：把我的整段解释都交给 Codex staged implement。",
+        "Task: update README.md.",
+    ])
+
+    result = _call(
+        workdir=str(repo),
+        task=verbose_task,
+        allowed_files=["README.md"],
+        allowed_globs=[],
+    )
+
+    assert result["status"] == "rejected_task_packet"
+    assert result["reason"] == "unsafe_task_packet"
+    assert "hermes_or_session_transcript_marker" in result["task_packet_violations"]
+    assert result["next_required_action"] == "provide_minimal_structured_task_packet"
+    assert result["runner_exit_code"] is None
+    assert calls == []
+
+
+def test_write_stage_files_renders_structured_codex_input_packet(tmp_path):
+    repo = _clean_repo(tmp_path)
+
+    _plan_path, prompt_path, _raw_dir = tool._write_stage_files(
+        repo=repo,
+        task="make a small README change",
+        allowlist={"files": ["README.md"], "globs": []},
+        verify_ids=["diff-check"],
+        continue_policy="stop-on-review-needed",
+        dirty_policy="require-clean",
+    )
+    prompt = prompt_path.read_text(encoding="utf-8")
+
+    assert prompt != "make a small README change"
+    assert "Objective:\nmake a small README change" in prompt
+    assert "Workdir:" in prompt
+    assert "Allowed files:\n- README.md" in prompt
+    assert "Verification:" in prompt
+    assert "Stop conditions:" in prompt
+
+
 @pytest.mark.parametrize(
     "scope",
     [
@@ -1437,7 +1490,11 @@ def test_runner_argv_and_plan_generation(tmp_path, monkeypatch):
     assert plan["dirty_baseline_policy"] == "require-clean"
     assert len(plan["slices"]) == 1
     stage_slice = plan["slices"][0]
-    assert Path(stage_slice["prompt_file"]).read_text(encoding="utf-8") == "update readme"
+    prompt_text = Path(stage_slice["prompt_file"]).read_text(encoding="utf-8")
+    assert prompt_text != "update readme"
+    assert "Objective:\nupdate readme" in prompt_text
+    assert "Allowed files:\n- README.md" in prompt_text
+    assert "Verification:\n- git diff --check" in prompt_text
     assert stage_slice["allowed_files"] == ["README.md"]
     assert stage_slice["verify_cmd_ids"] == ["diff-check"]
 

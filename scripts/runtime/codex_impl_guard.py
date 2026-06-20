@@ -33,6 +33,9 @@ from typing import Any
 _RUNTIME_DIR = Path(__file__).resolve().parent
 if str(_RUNTIME_DIR) not in sys.path:
     sys.path.insert(0, str(_RUNTIME_DIR))
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from codex_review_guard import (  # type: ignore  # noqa: E402
     _bounded,
@@ -40,6 +43,7 @@ from codex_review_guard import (  # type: ignore  # noqa: E402
     _is_source_like,
     _json_field_flood,
 )
+from tools.codex_input_packet import PacketLimits, validate_text_packet  # noqa: E402
 
 
 _STATUS_EXIT = {
@@ -50,6 +54,8 @@ _STATUS_EXIT = {
     "takeover_candidate": 2,
     "unusable": 3,
 }
+_MAX_PROMPT_PACKET_CHARS = 6_000
+_MAX_PROMPT_PACKET_LINES = 80
 
 
 class GitError(RuntimeError):
@@ -608,6 +614,15 @@ def _build_codex_prompt(base_prompt: str, files: list[str], globs: list[str]) ->
     ])
 
 
+def _prompt_packet_violations(base_prompt: str) -> list[str]:
+    return validate_text_packet(
+        base_prompt or "",
+        limits=PacketLimits(max_chars=_MAX_PROMPT_PACKET_CHARS, max_lines=_MAX_PROMPT_PACKET_LINES),
+        too_large_code="prompt_packet_too_large",
+        too_many_lines_code="prompt_packet_too_many_lines",
+    )
+
+
 def _run_codex(
     *,
     codex_bin: str,
@@ -967,6 +982,19 @@ def run(argv: list[str] | None = None) -> int:
         return _emit(dirty_error)
 
     prompt = args.prompt or Path(args.prompt_file).read_text(encoding="utf-8", errors="replace")
+    prompt_packet_violations = _prompt_packet_violations(prompt)
+    if prompt_packet_violations:
+        return _emit({
+            "status": "unusable",
+            "reason": "unsafe_prompt_packet",
+            "prompt_packet_violations": prompt_packet_violations,
+            "prompt_packet_policy": {
+                "max_chars": _MAX_PROMPT_PACKET_CHARS,
+                "max_lines": _MAX_PROMPT_PACKET_LINES,
+                "requires_minimal_structured_task_packet": True,
+            },
+            "recommended_next_action": "Pass only a minimal structured Codex task packet; put large context in repo files, docs_to_read, or bounded review packets.",
+        })
     codex_result = _run_codex(
         codex_bin=args.codex_bin,
         workdir=workdir,

@@ -30,8 +30,8 @@ def _metadata_from_packet(text: str) -> dict:
 
 def test_build_packet_includes_tracked_and_untracked_scope_files(tmp_path):
     repo = _clean_repo(tmp_path)
-    (repo / "README.md").write_text("hello\nchanged\n", encoding="utf-8")
-    (repo / "new_test.py").write_text("def test_new():\n    assert True\n", encoding="utf-8")
+    (repo / "README.md").write_text("hello\nSECRET_VALUE=should_not_leak\n", encoding="utf-8")
+    (repo / "new_test.py").write_text("def test_new():\n    assert 'untracked body must not leak'\n", encoding="utf-8")
 
     text = packet.build_packet(
         workdir=repo,
@@ -46,12 +46,34 @@ def test_build_packet_includes_tracked_and_untracked_scope_files(tmp_path):
     )
     metadata = _metadata_from_packet(text)
 
-    assert metadata["schema_version"] == "review_packet.v2"
+    assert metadata["schema_version"] == "review_packet.v3"
     assert metadata["touched_files"] == ["README.md", "new_test.py"]
     assert metadata["allowed_files"] == ["README.md", "new_test.py"]
     assert metadata["completion_trusted"] is False
     assert metadata["candidate_id"] == "cand-1"
-    assert "## bounded untracked file previews" in text
+    assert metadata["file_summaries"] == [
+        {
+            "path": "README.md",
+            "tracked": True,
+            "untracked": False,
+            "content_sha256": metadata["file_summaries"][0]["content_sha256"],
+        },
+        {
+            "path": "new_test.py",
+            "tracked": False,
+            "untracked": True,
+            "content_sha256": metadata["file_summaries"][1]["content_sha256"],
+        },
+    ]
+    assert len(metadata["file_summaries"][0]["content_sha256"]) == 64
+    assert len(metadata["file_summaries"][1]["content_sha256"]) == 64
+    assert "## structured diff summary" in text
+    assert "## bounded git diff" not in text
+    assert "## bounded untracked file previews" not in text
+    assert "diff --git" not in text
+    assert "@@" not in text
+    assert "SECRET_VALUE=should_not_leak" not in text
+    assert "untracked body must not leak" not in text
     assert "new_test.py" in text
 
 

@@ -137,6 +137,18 @@ _MIN_SPAWN_DEPTH = 1
 # No upper ceiling on spawn depth — like max_concurrent_children, depth has a
 # floor of 1 and no ceiling. Deeper trees multiply API cost, so the default
 # stays flat (MAX_DEPTH = 1); raising the config knob is an explicit opt-in.
+_MAX_DELEGATION_PACKET_CHARS = 12_000
+_MAX_DELEGATION_PACKET_LINES = 160
+_HERMES_DELEGATION_MARKERS = (
+    "技能检查点",
+    "准备执行：",
+    "预计：",
+    "卡住则：",
+    "MEMORY (your personal notes)",
+    "USER PROFILE (who the user is)",
+    "Current Session Context",
+    "[CONTEXT COMPACTION",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1986,6 +1998,19 @@ def _run_single_child(
             logger.debug("Failed to close child agent after delegation")
 
 
+def _delegation_packet_violations(*parts: Any) -> list[str]:
+    text = "\n".join(str(part or "") for part in parts)
+    violations: list[str] = []
+    if len(text) > _MAX_DELEGATION_PACKET_CHARS:
+        violations.append("delegation_packet_too_large")
+    if len(text.splitlines()) > _MAX_DELEGATION_PACKET_LINES:
+        violations.append("delegation_packet_too_many_lines")
+    lowered = text.lower()
+    if any(marker.lower() in lowered for marker in _HERMES_DELEGATION_MARKERS):
+        violations.append("hermes_or_session_transcript_marker")
+    return sorted(set(violations))
+
+
 def _recover_tasks_from_json_string(
     tasks: Any,
 ) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
@@ -2120,7 +2145,7 @@ def delegate_task(
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    # Validate each task has a goal and is a bounded delegation packet.
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -2128,6 +2153,18 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        packet_violations = _delegation_packet_violations(
+            task.get("goal", ""),
+            task.get("context", ""),
+        )
+        if packet_violations:
+            return tool_error(
+                "unsafe_delegation_packet: "
+                f"task {i} contains {', '.join(packet_violations)}. "
+                "Pass only a focused subtask, file paths, bounded errors, "
+                "constraints, and required output format; do not pass Hermes "
+                "session transcripts, memory/profile blocks, or long assistant text."
+            )
 
     overall_start = time.monotonic()
     results = []
@@ -2953,4 +2990,13 @@ registry.register(
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
+    side_effects={
+        "class": "spawn_subagent",
+        "scope": ["child_agent_session"],
+        "risk": "delegated_tool_use",
+        "may_write_files": True,
+        "may_access_network": True,
+        "inherits_parent_tool_limits": True,
+    },
+    artifact_outputs=[{"kind": "subagent_summary", "lifetime": "tool_result"}],
 )

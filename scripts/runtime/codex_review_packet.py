@@ -8,6 +8,7 @@ Codex does not run broad commands or flood stdout with source/diff output.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -53,6 +54,29 @@ def _bounded_untracked_previews(workdir: Path, files: list[str], limit: int) -> 
         truncated_any = truncated_any or truncated
         previews.append(f"### {name}\n\n```text\n{clipped.rstrip()}\n```")
     return "\n\n".join(previews), truncated_any
+
+
+def _file_sha256(workdir: Path, name: str) -> str | None:
+    root = workdir.resolve()
+    path = (workdir / name).resolve()
+    if not path.is_file() or not str(path).startswith(str(root) + "/"):
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _file_summaries(workdir: Path, touched_files: list[str], untracked_files: list[str]) -> list[dict[str, object]]:
+    untracked = set(untracked_files)
+    summaries: list[dict[str, object]] = []
+    for name in touched_files:
+        summaries.append(
+            {
+                "path": name,
+                "tracked": name not in untracked,
+                "untracked": name in untracked,
+                "content_sha256": _file_sha256(workdir, name),
+            }
+        )
+    return summaries
 
 
 def _clip(text: str, limit: int) -> tuple[str, bool]:
@@ -129,16 +153,11 @@ def build_packet(
     pathspec = ["--", *files] if files else []
     stat_raw = _run_git(workdir, ["diff", "--stat", *pathspec])
     names_raw = _run_git(workdir, ["diff", "--name-only", *pathspec])
-    diff_raw = _run_git(workdir, ["diff", "--unified=20", *pathspec])
+    numstat_raw = _run_git(workdir, ["diff", "--numstat", *pathspec])
     stat, stat_truncated = _clip(stat_raw, max_stat_chars)
     names, names_truncated = _clip(names_raw, max_name_chars)
-    diff, diff_truncated = _clip(diff_raw, max_diff_chars)
+    numstat, numstat_truncated = _clip(numstat_raw, max_stat_chars)
     untracked_files = _untracked_scope_files(workdir, files)
-    untracked_preview, untracked_truncated = _bounded_untracked_previews(
-        workdir,
-        untracked_files,
-        max(0, max_diff_chars - len(diff)),
-    )
     tracked_touched = [] if names_raw.startswith("[git ") else [line.strip() for line in names_raw.splitlines() if line.strip()]
     touched_files = _unique_preserve_order(tracked_touched + untracked_files)
     cleaned_allowed_files = _clean_list(allowed_files)
@@ -146,8 +165,9 @@ def build_packet(
     if files and not cleaned_allowed_files and not cleaned_allowed_globs:
         cleaned_allowed_files = _unique_preserve_order(_clean_list(files))
     metadata_header = {
-        "schema_version": "review_packet.v2",
+        "schema_version": "review_packet.v3",
         "touched_files": touched_files,
+        "file_summaries": _file_summaries(workdir, touched_files, untracked_files),
         "allowed_files": cleaned_allowed_files,
         "allowed_globs": cleaned_allowed_globs,
         "dirty_baseline": _clean_list(dirty_baseline),
@@ -158,9 +178,9 @@ def build_packet(
     }
 
     parts = [
-        "# Bounded Codex review packet",
+        "# Structured Codex review packet",
         "",
-        "Codex must review this packet only. Do not run shell commands. Do not request full source or full diffs.",
+        "Codex must review this structured packet only. Do not run shell commands. Do not request full source or full diffs.",
         "",
         "## Packet metadata header",
         "",
@@ -172,33 +192,33 @@ def build_packet(
         "",
         "\n".join(f"- `{name}`" for name in files) if files else "- all current git diff paths",
         "",
-        "## git diff --stat",
+        "## structured diff summary",
+        "",
+        "### diffstat",
         "",
         stat.rstrip() or "[no stat output]",
         "",
-        "## git diff --name-only",
+        "### numstat",
+        "",
+        numstat.rstrip() or "[no numstat output]",
+        "",
+        "### changed paths",
         "",
         names.rstrip() or "[no changed tracked files]",
         "",
-        "## bounded git diff",
+        "## test evidence",
         "",
-        diff.rstrip() or "[no diff output]",
+        "\n".join(f"- {item}" for item in _clean_list(tests_run)) if _clean_list(tests_run) else "- [no test evidence provided]",
         "",
     ]
-    if untracked_preview:
-        parts.extend([
-            "## bounded untracked file previews",
-            "",
-            untracked_preview.rstrip(),
-            "",
-        ])
     parts.extend([
         "## Packet limits",
         "",
         f"- stat_truncated={stat_truncated}",
         f"- names_truncated={names_truncated}",
-        f"- diff_truncated={diff_truncated}",
-        f"- untracked_truncated={untracked_truncated}",
+        f"- numstat_truncated={numstat_truncated}",
+        "- raw_diff_included=False",
+        "- untracked_previews_included=False",
         f"- max_total_chars={max_total_chars}",
     ])
     packet = "\n".join(parts) + "\n"

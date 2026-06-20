@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from tools.codex_input_packet import PacketLimits, validate_text_packet
 from tools.registry import registry
 
 
@@ -20,6 +21,8 @@ _REAL_CANDIDATE_REVIEW_GUARD_RUNNER = None
 _LIST_LIMIT = 80
 _STRING_LIMIT = 4000
 _DIRTY_PATH_LIMIT = 80
+_MAX_GOAL_PACKET_CHARS = 4_000
+_MAX_GOAL_PACKET_LINES = 20
 _MANDATORY_NON_GOALS = [
     "do not push, deploy, restart, merge, access secrets, or run real providers/data/media without explicit Hermes/user authorization",
     "do not use codex exec; this is an official Codex TUI /goal handoff",
@@ -613,6 +616,60 @@ def _non_goals_with_mandatory(args: dict[str, Any]) -> list[str]:
         if item not in non_goals:
             non_goals.append(item)
     return non_goals
+
+
+def _goal_packet_violations(text: str) -> list[str]:
+    return validate_text_packet(
+        text or "",
+        limits=PacketLimits(max_chars=_MAX_GOAL_PACKET_CHARS, max_lines=_MAX_GOAL_PACKET_LINES),
+        too_large_code="goal_packet_too_large",
+        too_many_lines_code="goal_packet_too_many_lines",
+    )
+
+
+def _goal_packet_text_from_args(args: dict[str, Any]) -> str:
+    parts = [
+        str(args.get("objective", "")),
+        *_string_list(args.get("docs_to_read")),
+        *_string_list(args.get("allowed_files")),
+        *_string_list(args.get("allowed_globs")),
+        *_non_goals_with_mandatory(args),
+        *_string_list(args.get("required_verification")),
+        *_string_list(args.get("stop_conditions")),
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _unsafe_goal_packet_result(
+    *,
+    mode: str,
+    repo: Path,
+    stage_id: Any,
+    preflight: dict[str, Any],
+    dirty_policy: Any,
+    git_head: str | None,
+    plan: dict[str, Any],
+    violations: list[str],
+) -> dict[str, Any]:
+    return _base_result(
+        status="unsafe_goal_packet",
+        mode=mode,
+        workdir=repo,
+        stage_id=stage_id,
+        preflight={**preflight, "blockers": [*preflight.get("blockers", []), "unsafe_goal_packet"]},
+        classification="blocked",
+        next_action="provide_minimal_structured_goal_packet",
+        candidate_disposition="planning_only",
+        dirty_baseline_policy=dirty_policy,
+        git_head=git_head,
+        plan=plan,
+        goal_packet_violations=violations,
+        goal_packet_policy={
+            "max_chars": _MAX_GOAL_PACKET_CHARS,
+            "max_lines": _MAX_GOAL_PACKET_LINES,
+            "requires_minimal_structured_goal_packet": True,
+        },
+    )
 
 
 def _one_line_goal(args: dict[str, Any]) -> str:
@@ -1322,9 +1379,46 @@ def _validate_required(args: dict[str, Any]) -> str | None:
     return None
 
 
-def codex_goal_run(args: dict[str, Any]) -> str:
+_GOAL_RUNTIME_AUTH_KEYS = {
+    "allow_isolated_worktree",
+    "standing_authorization",
+    "allow_real_adapter",
+    "review_runner_enabled",
+    "allow_real_review",
+    "review_guard_enabled",
+    "review_guard_subprocess_enabled",
+}
+
+
+def _apply_goal_runtime_authorization(
+    args: dict[str, Any],
+    runtime_authorization: dict[str, Any] | None,
+    *,
+    strip_model_authorization: bool,
+) -> dict[str, Any]:
+    sanitized = dict(args or {})
+    if strip_model_authorization:
+        for key in _GOAL_RUNTIME_AUTH_KEYS:
+            sanitized.pop(key, None)
+    for key, value in (runtime_authorization or {}).items():
+        if key in _GOAL_RUNTIME_AUTH_KEYS:
+            sanitized[key] = value
+    return sanitized
+
+
+def codex_goal_run(
+    args: dict[str, Any],
+    *,
+    runtime_authorization: dict[str, Any] | None = None,
+    strip_model_authorization: bool = False,
+) -> str:
     if not isinstance(args, dict):
         args = {}
+    args = _apply_goal_runtime_authorization(
+        args,
+        runtime_authorization,
+        strip_model_authorization=strip_model_authorization,
+    )
 
     mode = args.get("mode")
     if mode not in _SUPPORTED_MODES:
@@ -1705,6 +1799,22 @@ def codex_goal_run(args: dict[str, Any]) -> str:
             )
         )
 
+    if mode == "prepare_goal":
+        goal_packet_violations = _goal_packet_violations(_goal_packet_text_from_args(args))
+        if goal_packet_violations:
+            return _json_result(
+                _unsafe_goal_packet_result(
+                    mode=mode,
+                    repo=repo,
+                    stage_id=args.get("stage_id"),
+                    preflight=preflight,
+                    dirty_policy=dirty_policy,
+                    git_head=git_head,
+                    plan=plan,
+                    violations=goal_packet_violations,
+                )
+            )
+
     if mode == "launch_goal":
         goal_text, goal_error = _read_one_line_goal(args, repo)
         if goal_error:
@@ -1721,6 +1831,21 @@ def codex_goal_run(args: dict[str, Any]) -> str:
                     dirty_baseline_policy=dirty_policy,
                     git_head=git_head,
                     plan=plan,
+                )
+            )
+
+        goal_packet_violations = _goal_packet_violations(goal_text or "")
+        if goal_packet_violations:
+            return _json_result(
+                _unsafe_goal_packet_result(
+                    mode=mode,
+                    repo=repo,
+                    stage_id=args.get("stage_id"),
+                    preflight=preflight,
+                    dirty_policy=dirty_policy,
+                    git_head=git_head,
+                    plan=plan,
+                    violations=goal_packet_violations,
                 )
             )
 
@@ -1833,7 +1958,6 @@ _SCHEMA = {
             "stop_conditions": {"type": "array", "items": {"type": "string"}},
             "mode": {"type": "string", "enum": ["dry_run_plan", "prepare_goal", "launch_goal", "monitor_goal", "collect_candidate", "review_candidate"]},
             "dirty_baseline_policy": {"type": "string", "enum": ["require-clean"]},
-            "allow_isolated_worktree": {"type": "boolean"},
             "goal_artifact_dir": {"type": "string"},
             "rich_goal_file": {"type": "string"},
             "one_line_goal_file": {"type": "string"},
@@ -1841,13 +1965,7 @@ _SCHEMA = {
             "timeout_seconds": {"type": "integer"},
             "monitor_interval_seconds": {"type": "integer"},
             "max_wait_windows": {"type": "integer"},
-            "standing_authorization": {"type": "boolean"},
             "adapter_enabled": {"type": "boolean"},
-            "allow_real_adapter": {"type": "boolean"},
-            "review_runner_enabled": {"type": "boolean"},
-            "allow_real_review": {"type": "boolean"},
-            "review_guard_enabled": {"type": "boolean"},
-            "review_guard_subprocess_enabled": {"type": "boolean"},
             "review_replay": {"type": "object"},
         },
         "required": ["workdir", "stage_id", "objective", "mode", "dirty_baseline_policy"],
@@ -1859,6 +1977,18 @@ registry.register(
     name="codex_goal_run",
     toolset="codex_goal_run",
     schema=_SCHEMA,
-    handler=lambda args, **kwargs: codex_goal_run(args),
+    handler=lambda args, **kwargs: codex_goal_run(args, runtime_authorization=kwargs, strip_model_authorization=True),
     description=_SCHEMA["description"],
+    side_effects={
+        "class": "codex_goal_workflow",
+        "scope": ["git_workdir", "goal_artifact_dir", "codex_tui_session"],
+        "risk": "candidate_repo_write",
+        "may_write_files": True,
+        "may_spawn_codex": True,
+        "guarded": True,
+    },
+    artifact_outputs=[
+        {"kind": "goal_artifact", "lifetime": "candidate"},
+        {"kind": "review_summary", "lifetime": "tool_result"},
+    ],
 )

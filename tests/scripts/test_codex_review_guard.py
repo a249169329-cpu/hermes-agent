@@ -1,6 +1,7 @@
 import json
 
 from scripts.runtime import codex_review_guard as guard
+from scripts.runtime import codex_review_packet
 
 
 def _payload(capsys):
@@ -66,3 +67,95 @@ def test_run_missing_review_packet_file_fails_before_codex_launch(tmp_path, caps
     assert result["reason"] == "review_packet_file_missing"
     assert result["review_packet_file"] == str(missing_packet.resolve())
     assert "codex_exit_code" not in result
+
+
+def test_run_rejects_verbose_hermes_review_prompt_before_codex_launch(tmp_path, capsys, monkeypatch):
+    calls = []
+
+    def fake_popen(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("Codex must not launch for unsafe review prompt packets")
+
+    monkeypatch.setattr(guard.subprocess, "Popen", fake_popen)
+    verbose_prompt = "\n".join([
+        "技能检查点：已加载 hermes-agent/codex。",
+        "MEMORY (your personal notes) [99%]",
+        "USER PROFILE (who the user is)",
+        "准备执行：把我的整段解释都交给 Codex review。",
+        "Review this tiny diff.",
+    ])
+
+    exit_code = guard.run([
+        "--workdir",
+        str(tmp_path),
+        "--prompt",
+        verbose_prompt,
+    ])
+    result = _payload(capsys)
+
+    assert exit_code == 2
+    assert result["status"] == "unusable"
+    assert result["reason"] == "unsafe_review_prompt_packet"
+    assert "hermes_or_session_transcript_marker" in result["review_prompt_packet_violations"]
+    assert result["next_action"] == "provide_minimal_review_prompt_and_bounded_review_packet"
+    assert "codex_exit_code" not in result
+    assert calls == []
+
+
+def test_run_rejects_unsafe_review_packet_file_before_codex_launch(tmp_path, capsys, monkeypatch):
+    calls = []
+
+    def fake_popen(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("Codex must not launch for unsafe review packet files")
+
+    monkeypatch.setattr(guard.subprocess, "Popen", fake_popen)
+    packet = tmp_path / "review-packet.md"
+    packet.write_text(
+        "\n".join([
+            "## bounded review packet",
+            "MEMORY (your personal notes)",
+            "diff --git a/secret.py b/secret.py",
+            "+TOKEN=sk-proj-abcdef1234567890",
+        ]),
+        encoding="utf-8",
+    )
+
+    exit_code = guard.run([
+        "--workdir",
+        str(tmp_path),
+        "--prompt",
+        "review this bounded packet",
+        "--review-packet-file",
+        str(packet),
+    ])
+    result = _payload(capsys)
+
+    assert exit_code == 2
+    assert result["status"] == "unusable"
+    assert result["reason"] == "unsafe_review_packet_file"
+    assert "hermes_or_session_transcript_marker" in result["review_packet_violations"]
+    assert "raw_diff_or_patch_marker" in result["review_packet_violations"]
+    assert "secret_marker" in result["review_packet_violations"]
+    assert "codex_exit_code" not in result
+    assert calls == []
+
+
+def test_review_packet_guard_allows_structured_packet_bullets(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+
+    packet = codex_review_packet.build_packet(
+        workdir=repo,
+        files=["README.md"],
+        max_stat_chars=1000,
+        max_name_chars=1000,
+        max_diff_chars=3000,
+        max_total_chars=5000,
+        tests_run=["focused tests passed"],
+    )
+
+    assert "- `README.md`" in packet
+    assert "- focused tests passed" in packet
+    assert guard._review_packet_file_violations(packet) == []

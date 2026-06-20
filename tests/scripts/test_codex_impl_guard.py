@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 
 from scripts.runtime import codex_impl_guard as guard
+from tools.codex_input_packet import CodexInputPacket, render_codex_exec_prompt
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -88,3 +89,72 @@ def test_safe_output_path_rejects_repo_local_outputs(tmp_path):
     assert error is not None
     assert error["reason"] == "unsafe_output_path"
     assert error["unsafe_output_path_detail"] == "inside_workdir"
+
+
+def test_run_rejects_verbose_hermes_transcript_prompt_before_codex(tmp_path, capsys, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    calls = []
+
+    def fake_run_codex(**kwargs):
+        calls.append(kwargs)
+        return {
+            "codex_exit_code": 0,
+            "terminated_by_guard": False,
+            "reason": "ok",
+            "stdout_chars": 0,
+            "stdout_lines": 0,
+            "source_like_lines": 0,
+            "diff_like_lines": 0,
+            "source_flood_detected": False,
+            "diff_flood_detected": False,
+            "json_field_flood_detected": False,
+        }
+
+    monkeypatch.setenv("HERMES_CODEX_IMPL_GUARD_ALLOW_FAKE_CODEX", "1")
+    monkeypatch.setattr(guard, "_run_codex", fake_run_codex)
+    verbose_prompt = "\n".join(
+        [
+            "技能检查点：已加载 hermes-agent/codex。",
+            "MEMORY (your personal notes) [99%]",
+            "USER PROFILE (who the user is)",
+            "准备执行：把我的整段解释都交给 Codex。",
+            "Task: make the README clearer.",
+        ]
+    )
+
+    exit_code = guard.run([
+        "--workdir",
+        str(repo),
+        "--prompt",
+        verbose_prompt,
+        "--allowed-file",
+        "README.md",
+    ])
+    result = _payload(capsys)
+
+    assert exit_code == 3
+    assert result["status"] == "unusable"
+    assert result["reason"] == "unsafe_prompt_packet"
+    assert "hermes_or_session_transcript_marker" in result["prompt_packet_violations"]
+    assert calls == []
+
+
+def test_prompt_packet_policy_rejects_large_context_without_hermes_markers():
+    violations = guard._prompt_packet_violations("x" * (guard._MAX_PROMPT_PACKET_CHARS + 1))
+
+    assert violations == ["prompt_packet_too_large"]
+
+
+def test_prompt_packet_policy_allows_structured_codex_packet_bullets(tmp_path):
+    packet = CodexInputPacket(
+        objective="Do bounded edit",
+        workdir=str(tmp_path),
+        allowed_files=["README.md"],
+        verification=["python -m pytest tests/tools/test_codex_staged_implement_tool.py -q"],
+        stop_conditions=["stop on failure"],
+    )
+    prompt = render_codex_exec_prompt(packet)
+
+    assert "Allowed files:\n- README.md" in prompt
+    assert "Verification:\n- python -m pytest" in prompt
+    assert guard._prompt_packet_violations(prompt) == []

@@ -184,6 +184,33 @@ class TestDelegateTask(unittest.TestCase):
         result = json.loads(delegate_task(tasks=[{"context": "no goal here"}], parent_agent=parent))
         self.assertIn("error", result)
 
+    @patch("tools.delegate_tool._build_child_agent")
+    def test_rejects_verbose_hermes_delegation_packet_before_child_prompt(self, mock_build):
+        mock_build.side_effect = AssertionError(
+            "child prompt must not be built for unsafe delegation packets"
+        )
+        parent = _make_mock_parent()
+        verbose_context = "\n".join([
+            "技能检查点：已加载 project-dev-workflow。",
+            "MEMORY (your personal notes) [99%]",
+            "USER PROFILE (who the user is)",
+            "准备执行：把父会话整段上下文交给 subagent。",
+            "Use files/tests instead of parent transcript.",
+        ])
+
+        result = json.loads(
+            delegate_task(
+                goal="Audit this repo input/output contracts",
+                context=verbose_context,
+                parent_agent=parent,
+            )
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("unsafe_delegation_packet", result["error"])
+        self.assertIn("hermes_or_session_transcript_marker", result["error"])
+        mock_build.assert_not_called()
+
     @patch("tools.delegate_tool._run_single_child")
     def test_single_task_mode(self, mock_run):
         mock_run.return_value = {

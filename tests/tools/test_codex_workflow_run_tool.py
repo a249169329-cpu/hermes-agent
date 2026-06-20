@@ -27,6 +27,19 @@ def _clean_repo(tmp_path: Path) -> Path:
 
 
 def _call(**kwargs):
+    runtime_authorization = {
+        key: kwargs.pop(key)
+        for key in list(kwargs)
+        if key
+        in {
+            "standing_authorization",
+            "auto_clean_cache",
+            "allow_isolated_worktree",
+            "checkpoint_verified_diff",
+            "verification_evidence",
+            "checkpoint_message",
+        }
+    }
     defaults = {
         "task": "make a small change",
         "allowed_files": ["README.md"],
@@ -37,7 +50,7 @@ def _call(**kwargs):
         "mode": "execute",
     }
     defaults.update(kwargs)
-    return json.loads(workflow.codex_workflow_run(defaults))
+    return json.loads(workflow.codex_workflow_run(defaults, runtime_authorization=runtime_authorization))
 
 
 def _sha256(path: Path) -> str:
@@ -114,6 +127,74 @@ def test_preflight_passed_requires_consistent_checks_and_no_blockers():
     assert workflow._preflight_passed({"status": "passed", "checks": {}, "blockers": []}) is False
     assert workflow._preflight_passed({"status": "passed", "checks": {"codex_bin_found": False}, "blockers": []}) is False
     assert workflow._preflight_passed({"status": "passed", "checks": {"codex_bin_found": True}, "blockers": ["x"]}) is False
+
+
+def test_verbose_hermes_task_packet_rejected_before_staged(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    calls = []
+
+    def fake_staged(args):
+        calls.append(args)
+        raise AssertionError("unsafe task packet must not call staged implementation")
+
+    monkeypatch.setattr(workflow.staged, "codex_staged_implement", fake_staged)
+
+    result = _call(
+        workdir=str(repo),
+        task="技能检查点：已加载 codex。\nMEMORY (your personal notes)\nFix README.",
+    )
+
+    assert result["status"] == "rejected_task_packet"
+    assert result["reason"] == "unsafe_task_packet"
+    assert "hermes_or_session_transcript_marker" in result["task_packet_violations"]
+    assert result["next_required_action"] == "provide_minimal_structured_task_packet"
+    assert result["codex_staged_result"] is None
+    assert calls == []
+
+
+def test_unsupported_review_policy_rejected_before_staged(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    calls = []
+
+    def fake_staged(args):
+        calls.append(args)
+        raise AssertionError("invalid review_policy must not call staged implementation")
+
+    monkeypatch.setattr(workflow.staged, "codex_staged_implement", fake_staged)
+
+    result = _call(workdir=str(repo), review_policy="always_double_review")
+
+    assert result["status"] == "rejected_policy"
+    assert result["reason"] == "unsupported_review_policy"
+    assert result["codex_staged_result"] is None
+    assert calls == []
+
+
+def test_workflow_execute_routes_structured_codex_input_packet_to_staged_runner(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    captured_prompts = []
+
+    def fake_runner(argv, *, env=None):
+        plan_path = Path(argv[argv.index("--plan-file") + 1])
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        prompt_path = Path(plan["slices"][0]["prompt_file"])
+        captured_prompts.append(prompt_path.read_text(encoding="utf-8"))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({"status": "completed", "verification_status": "passed", "changed_files": []}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(workflow.staged, "_run_runner", fake_runner)
+
+    result = _call(workdir=str(repo), task="make a small README change", allowed_files=["README.md"])
+
+    assert result["status"] == "staged_called"
+    assert captured_prompts
+    assert captured_prompts[0] != "make a small README change"
+    assert "Objective:\nmake a small README change" in captured_prompts[0]
+    assert "Allowed files:\n- README.md" in captured_prompts[0]
 
 
 def test_preflight_blocked_clean_repo_does_not_call_staged(tmp_path, monkeypatch):
@@ -690,11 +771,83 @@ def test_registration_and_core_toolset_exposure():
     schema = registry.get_schema("codex_workflow_run")
 
     assert schema is not None
+    props = schema["parameters"]["properties"]
+    for runtime_only_field in (
+        "standing_authorization",
+        "auto_clean_cache",
+        "allow_isolated_worktree",
+        "checkpoint_verified_diff",
+        "verification_evidence",
+        "checkpoint_message",
+    ):
+        assert runtime_only_field not in props
     assert registry.get_toolset_for_tool("codex_workflow_run") == "codex_staged_implement"
     assert "codex_workflow_run" in toolsets._HERMES_CORE_TOOLS
     assert "codex_workflow_run" in toolsets.resolve_toolset("codex_staged_implement")
     assert "codex_staged_implement" in toolsets.resolve_toolset("codex_staged_implement")
     assert "codex_workflow_run" in toolsets.resolve_toolset("codex_workflow_run")
+
+
+def test_registry_dispatch_ignores_model_supplied_workflow_authorization(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    cache_path = repo / ".pytest_cache" / "v" / "cache" / "nodeids"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("cached\n", encoding="utf-8")
+    monkeypatch.setattr(workflow.staged, "codex_staged_implement", lambda args: {"status": "should_not_run"})
+
+    result = json.loads(
+        registry.dispatch(
+            "codex_workflow_run",
+            {
+                "workdir": str(repo),
+                "task": "make a small change",
+                "allowed_files": ["README.md"],
+                "dirty_baseline_policy": "require-clean",
+                "standing_authorization": True,
+                "auto_clean_cache": True,
+            },
+        )
+    )
+
+    assert result["status"] == "dirty_recovery_required"
+    assert cache_path.exists()
+
+
+def test_model_supplied_checkpoint_fields_do_not_commit_even_with_runtime_auth(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    initial_head = _git(repo, "rev-parse", "HEAD")
+    evidence = {}
+
+    def fake_staged(args):
+        (Path(args["workdir"]) / "README.md").write_text("hello\nchanged\n", encoding="utf-8")
+        evidence.update(_verified_evidence(repo))
+        return json.dumps({"status": "ready_for_review", "candidate_id": "cand-model-checkpoint"})
+
+    monkeypatch.setattr(workflow.staged, "codex_staged_implement", fake_staged)
+
+    result = json.loads(
+        workflow.codex_workflow_run(
+            {
+                "workdir": str(repo),
+                "task": "make a small change",
+                "allowed_files": ["README.md"],
+                "allowed_globs": [],
+                "verify_cmd_ids": ["diff-check"],
+                "continue_policy": "stop-on-review-needed",
+                "dirty_baseline_policy": "require-clean",
+                "mode": "execute",
+                "checkpoint_verified_diff": True,
+                "verification_evidence": evidence,
+                "checkpoint_message": "model supplied checkpoint should be ignored",
+            },
+            runtime_authorization={"standing_authorization": True},
+        )
+    )
+
+    assert result["status"] == "staged_called"
+    assert "checkpoint" not in result
+    assert _git(repo, "rev-parse", "HEAD") == initial_head
+    assert "README.md" in _git(repo, "status", "--porcelain=v1", "--untracked-files=all")
 
 
 def test_schema_has_no_executable_command_suggestions():
@@ -860,17 +1013,18 @@ def test_leftover_candidate_reported_after_staged_leaves_dirty(tmp_path, monkeyp
             }
         )
 
+    def fake_review(**kwargs):
+        raise AssertionError("default hermes_only policy must not run Codex packet review")
+
     monkeypatch.setattr(workflow.staged, "codex_staged_implement", fake_staged)
-    monkeypatch.setattr(
-        workflow,
-        "_run_packet_only_review",
-        lambda **kwargs: _packet_review("packet_only_unusable", must_fix_count=None),
-        raising=False,
-    )
+    monkeypatch.setattr(workflow, "_run_packet_only_review", fake_review, raising=False)
 
     result = _call(workdir=str(repo))
 
-    assert result["status"] == "staged_review_unavailable"
+    assert result["status"] == "staged_called"
+    assert result["review_policy"] == "hermes_only"
+    assert result["codex_packet_review"]["status"] == "not_run"
+    assert result["codex_packet_review"]["reason"] == "review_policy_hermes_only"
     assert result["leftover_candidate"]["requires_review"] is True
     assert result["leftover_candidate"]["requires_hermes_verification"] is True
     assert result["leftover_candidate"]["candidate_id"] == "cand-left"
@@ -1030,7 +1184,39 @@ def _packet_review(status: str, *, must_fix_count: int | None = 0, summary: str 
     }
 
 
-def test_auto_packet_review_passes_ready_candidate(tmp_path, monkeypatch):
+def test_default_review_policy_is_hermes_only_and_does_not_run_codex_review(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+
+    def fake_staged(args):
+        (Path(args["workdir"]) / "README.md").write_text("hello\nneeds hermes review\n", encoding="utf-8")
+        return json.dumps(
+            {
+                "status": "ready_for_review",
+                "candidate_id": "cand-hermes-only",
+                "candidate_disposition": "pending_review",
+                "completion_trusted": True,
+            }
+        )
+
+    def fake_review(**kwargs):
+        raise AssertionError("default workflow review policy must not run Codex packet review")
+
+    monkeypatch.setattr(workflow.staged, "codex_staged_implement", fake_staged)
+    monkeypatch.setattr(workflow, "_run_packet_only_review", fake_review, raising=False)
+
+    result = _call(workdir=str(repo))
+
+    assert result["status"] == "staged_called"
+    assert result["preflight"]["status"] == "passed"
+    assert result["review_policy"] == "hermes_only"
+    assert result["codex_packet_review"]["status"] == "not_run"
+    assert result["codex_packet_review"]["reason"] == "review_policy_hermes_only"
+    assert result["leftover_candidate"]["requires_review"] is True
+    assert result["leftover_candidate"]["requires_fixes"] is False
+    assert result["leftover_candidate"]["requires_hermes_verification"] is True
+
+
+def test_codex_packet_review_policy_passes_ready_candidate(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
     review_calls = []
 
@@ -1052,10 +1238,11 @@ def test_auto_packet_review_passes_ready_candidate(tmp_path, monkeypatch):
     monkeypatch.setattr(workflow.staged, "codex_staged_implement", fake_staged)
     monkeypatch.setattr(workflow, "_run_packet_only_review", fake_review, raising=False)
 
-    result = _call(workdir=str(repo))
+    result = _call(workdir=str(repo), review_policy="codex_packet")
 
     assert result["status"] == "staged_reviewed"
     assert result["preflight"]["status"] == "passed"
+    assert result["review_policy"] == "codex_packet"
     assert result["codex_packet_review"]["status"] == "packet_only_passed"
     assert result["codex_packet_review"]["must_fix_count"] == 0
     assert result["leftover_candidate"]["requires_review"] is False
@@ -1068,7 +1255,7 @@ def test_auto_packet_review_passes_ready_candidate(tmp_path, monkeypatch):
     assert "dirty" not in review_calls[0]
 
 
-def test_auto_packet_review_blocks_on_must_fix(tmp_path, monkeypatch):
+def test_codex_packet_review_policy_blocks_on_must_fix(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
 
     def fake_staged(args):
@@ -1083,7 +1270,7 @@ def test_auto_packet_review_blocks_on_must_fix(tmp_path, monkeypatch):
         raising=False,
     )
 
-    result = _call(workdir=str(repo))
+    result = _call(workdir=str(repo), review_policy="codex_packet")
 
     assert result["status"] == "staged_review_blocked"
     assert result["codex_packet_review"]["status"] == "packet_only_failed"
@@ -1093,7 +1280,7 @@ def test_auto_packet_review_blocks_on_must_fix(tmp_path, monkeypatch):
     assert result["leftover_candidate"]["requires_hermes_verification"] is True
 
 
-def test_auto_packet_review_unusable_fail_closed(tmp_path, monkeypatch):
+def test_codex_packet_review_policy_unusable_fail_closed(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
 
     def fake_staged(args):
@@ -1108,7 +1295,7 @@ def test_auto_packet_review_unusable_fail_closed(tmp_path, monkeypatch):
         raising=False,
     )
 
-    result = _call(workdir=str(repo))
+    result = _call(workdir=str(repo), review_policy="codex_packet")
 
     assert result["status"] == "staged_review_unavailable"
     assert result["codex_packet_review"]["status"] == "packet_only_unusable"
@@ -1117,7 +1304,7 @@ def test_auto_packet_review_unusable_fail_closed(tmp_path, monkeypatch):
     assert result["leftover_candidate"]["requires_hermes_verification"] is True
 
 
-def test_takeover_candidate_review_pass_does_not_become_trusted_completion(tmp_path, monkeypatch):
+def test_takeover_candidate_codex_packet_review_pass_does_not_become_trusted_completion(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
 
     def fake_staged(args):
@@ -1139,7 +1326,7 @@ def test_takeover_candidate_review_pass_does_not_become_trusted_completion(tmp_p
         raising=False,
     )
 
-    result = _call(workdir=str(repo))
+    result = _call(workdir=str(repo), review_policy="codex_packet")
 
     assert result["status"] == "staged_reviewed"
     assert result["codex_staged_result"]["status"] == "takeover_candidate"
@@ -1219,7 +1406,7 @@ def test_review_output_is_bounded(tmp_path, monkeypatch):
     monkeypatch.setattr(workflow.staged, "codex_staged_implement", fake_staged)
     monkeypatch.setattr(workflow, "_run_packet_only_review", fake_review, raising=False)
 
-    result = _call(workdir=str(repo))
+    result = _call(workdir=str(repo), review_policy="codex_packet")
     encoded = json.dumps(result)
 
     assert result["codex_packet_review"]["status"] == "packet_only_passed"

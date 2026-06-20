@@ -11,12 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from tools import codex_staged_implement_tool as staged
+from tools.codex_input_packet import PacketLimits, validate_text_packet
 from tools.registry import registry
 
 
 _SUPPORTED_MODES = {"execute", "dry_run"}
 _SUPPORTED_CONTINUE_POLICY = "stop-on-review-needed"
 _SUPPORTED_DIRTY_POLICY = "require-clean"
+_DEFAULT_REVIEW_POLICY = "hermes_only"
+_SUPPORTED_REVIEW_POLICIES = {_DEFAULT_REVIEW_POLICY, "codex_packet"}
 _ALLOWED_VERIFY_IDS = {"diff-check", "none"}
 _AUTO_PACKET_REVIEW_STATUSES = {"ready_for_review", "review_needed", "takeover_candidate"}
 _PACKET_REVIEW_STATUSES = {"packet_only_passed", "packet_only_failed", "packet_only_unusable"}
@@ -31,6 +34,8 @@ _PACKET_REVIEW_SUMMARY_KEYS = {
 }
 _MAX_PACKET_REVIEW_SUMMARY_CHARS = 1200
 _SUMMARY_LEAK_MARKERS = ("diff --git", "\n@@", "@@ ", "--- a/", "+++ b/")
+_MAX_TASK_PACKET_CHARS = 6_000
+_MAX_TASK_PACKET_LINES = 80
 _OWNER_CLASSES = (
     "current_session",
     "other_known_session",
@@ -84,6 +89,15 @@ def _base(
     return result
 
 
+def _task_packet_violations(task: str) -> list[str]:
+    return validate_text_packet(
+        task or "",
+        limits=PacketLimits(max_chars=_MAX_TASK_PACKET_CHARS, max_lines=_MAX_TASK_PACKET_LINES),
+        too_large_code="task_packet_too_large",
+        too_many_lines_code="task_packet_too_many_lines",
+    )
+
+
 def _validate_common(args: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     mode = args.get("mode", "execute")
     if mode not in _SUPPORTED_MODES:
@@ -96,6 +110,10 @@ def _validate_common(args: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[
     dirty_policy = args.get("dirty_baseline_policy", _SUPPORTED_DIRTY_POLICY)
     if dirty_policy != _SUPPORTED_DIRTY_POLICY:
         return None, _base("rejected_policy", reason="unsupported_dirty_baseline_policy")
+
+    review_policy = args.get("review_policy", _DEFAULT_REVIEW_POLICY)
+    if not isinstance(review_policy, str) or review_policy not in _SUPPORTED_REVIEW_POLICIES:
+        return None, _base("rejected_policy", reason="unsupported_review_policy")
 
     verify_ids = args.get("verify_cmd_ids", ["diff-check"])
     if verify_ids is None:
@@ -111,6 +129,19 @@ def _validate_common(args: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[
     task = args.get("task")
     if not isinstance(task, str) or not task.strip():
         return None, _base("rejected_scope", reason="missing_task")
+    task_violations = _task_packet_violations(task)
+    if task_violations:
+        return None, _base(
+            "rejected_task_packet",
+            reason="unsafe_task_packet",
+            task_packet_violations=task_violations,
+            task_packet_policy={
+                "max_chars": _MAX_TASK_PACKET_CHARS,
+                "max_lines": _MAX_TASK_PACKET_LINES,
+                "requires_minimal_structured_task_packet": True,
+            },
+            next_required_action="provide_minimal_structured_task_packet",
+        )
 
     repo, git_head = staged._resolve_repo_root(args.get("workdir"))
     if repo is None:
@@ -134,6 +165,7 @@ def _validate_common(args: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[
         "repo": repo,
         "git_head": git_head,
         "mode": mode,
+        "review_policy": review_policy,
         "normalized": normalized,
         "allowlist": allowlist,
     }, None
@@ -466,6 +498,7 @@ def _normalize_packet_review_result(raw: Any) -> dict[str, Any]:
 
 def _should_auto_packet_review(
     *,
+    review_policy: str,
     staged_result: dict[str, Any],
     post_dirty: dict[str, Any],
     checkpoint_requested: bool,
@@ -477,6 +510,8 @@ def _should_auto_packet_review(
     status = staged_result.get("status")
     if status not in _AUTO_PACKET_REVIEW_STATUSES:
         return False, f"staged_status_{status or 'missing'}"
+    if review_policy != "codex_packet":
+        return False, f"review_policy_{review_policy}"
     return True, "candidate_ready"
 
 
@@ -745,6 +780,7 @@ def _finish_after_staged(
         dirty=initial_dirty,
         preflight=preflight,
         codex_staged_result=staged_result,
+        review_policy=str(args.get("review_policy", _DEFAULT_REVIEW_POLICY)),
     )
     if dirty_recovery_update:
         result["dirty_recovery"].update(dirty_recovery_update)
@@ -791,6 +827,7 @@ def _finish_after_staged(
     if not post_dirty.get("is_clean"):
         leftover = _leftover_candidate(post_dirty, staged_result)
         should_review, reason = _should_auto_packet_review(
+            review_policy=result["review_policy"],
             staged_result=staged_result,
             post_dirty=post_dirty,
             checkpoint_requested=checkpoint_requested,
@@ -966,9 +1003,30 @@ def _create_isolated_worktree(repo: Path, *, stage_id: Any, git_head: str | None
     return {"path": str(worktree), "branch": branch, "source_head": git_head}
 
 
-def codex_workflow_run(args: dict[str, Any]) -> str:
+_WORKFLOW_RUNTIME_AUTH_KEYS = {
+    "standing_authorization",
+    "auto_clean_cache",
+    "allow_isolated_worktree",
+    "checkpoint_verified_diff",
+    "verification_evidence",
+    "checkpoint_message",
+}
+
+
+def _runtime_authorized_args(args: dict[str, Any], runtime_authorization: dict[str, Any] | None) -> dict[str, Any]:
+    sanitized = dict(args or {})
+    for key in _WORKFLOW_RUNTIME_AUTH_KEYS:
+        sanitized.pop(key, None)
+    for key, value in (runtime_authorization or {}).items():
+        if key in _WORKFLOW_RUNTIME_AUTH_KEYS:
+            sanitized[key] = value
+    return sanitized
+
+
+def codex_workflow_run(args: dict[str, Any], *, runtime_authorization: dict[str, Any] | None = None) -> str:
     if not isinstance(args, dict):
         args = {}
+    args = _runtime_authorized_args(args, runtime_authorization)
 
     validated, error = _validate_common(args)
     if error is not None:
@@ -1090,7 +1148,8 @@ _SCHEMA = {
         "candidate implementation. It validates repo, scope, policies, and local Codex "
         "workflow preflight; may remove cache-only dirty paths with standing authorization; "
         "may create an isolated clean worktree with standing authorization; delegates to "
-        "codex_staged_implement; then runs bounded packet-only review for safe staged candidates."
+        "codex_staged_implement; Hermes reviews by default, with bounded packet-only Codex "
+        "review available only when review_policy='codex_packet'."
     ),
     "parameters": {
         "type": "object",
@@ -1105,13 +1164,12 @@ _SCHEMA = {
             },
             "continue_policy": {"type": "string", "enum": ["stop-on-review-needed"]},
             "dirty_baseline_policy": {"type": "string", "enum": ["require-clean"]},
-            "standing_authorization": {"type": "boolean"},
-            "auto_clean_cache": {"type": "boolean"},
-            "allow_isolated_worktree": {"type": "boolean"},
+            "review_policy": {
+                "type": "string",
+                "enum": ["hermes_only", "codex_packet"],
+                "description": "Review policy for Codex candidates. Default hermes_only leaves review to Hermes; codex_packet opts into an extra bounded read-only Codex packet review.",
+            },
             "stage_id": {"type": "string"},
-            "checkpoint_verified_diff": {"type": "boolean"},
-            "verification_evidence": {"type": "object"},
-            "checkpoint_message": {"type": "string"},
             "mode": {"type": "string", "enum": ["execute", "dry_run"]},
         },
         "required": ["workdir", "task"],
@@ -1123,6 +1181,18 @@ registry.register(
     name="codex_workflow_run",
     toolset="codex_staged_implement",
     schema=_SCHEMA,
-    handler=lambda args, **kwargs: codex_workflow_run(args),
+    handler=lambda args, **kwargs: codex_workflow_run(args, runtime_authorization=kwargs),
     description=_SCHEMA["description"],
+    side_effects={
+        "class": "codex_candidate_workflow",
+        "scope": ["git_workdir", "isolated_worktree", "codex_subprocess"],
+        "risk": "candidate_repo_write",
+        "may_write_files": True,
+        "may_spawn_codex": True,
+        "guarded": True,
+    },
+    artifact_outputs=[
+        {"kind": "candidate_diff", "lifetime": "candidate"},
+        {"kind": "review_summary", "lifetime": "tool_result"},
+    ],
 )

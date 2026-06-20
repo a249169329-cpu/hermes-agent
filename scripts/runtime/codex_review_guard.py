@@ -26,6 +26,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.codex_input_packet import PacketLimits, validate_text_packet  # noqa: E402
+
 
 DEFAULT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -54,9 +60,23 @@ SOURCE_LINE_RE = re.compile(
     r"(const|let|var)\s+\w+\s*=|return\s+|if\s+|elif\s+|else:|for\s+|"
     r"while\s+|try:|except\s+|<div|<span|<template|<script|</|public\s+|private\s+)"
 )
-DIFF_LINE_RE = re.compile(r"^(diff --git |@@|--- a/|\+\+\+ b/|[+-][^+-])")
+DIFF_LINE_RE = re.compile(r"^(diff --git |@@|--- a/|\+\+\+ b/|[+-](?![+\-\s]))")
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 JSON_FLOOD_FIELD_NAMES = {"aggregated_output", "output", "content", "text"}
+_MAX_REVIEW_PROMPT_PACKET_CHARS = 6_000
+_MAX_REVIEW_PROMPT_PACKET_LINES = 80
+_MAX_REVIEW_PACKET_CHARS = 12_000
+_MAX_REVIEW_PACKET_LINES = 240
+SECRET_RE = re.compile(
+    r"Bearer\s+[A-Za-z0-9._\-]{8,}|\b(?:sk|pk|rk)-[A-Za-z0-9._\-]{8,}\b|"
+    r"\b(?:ghp|github_pat)_[A-Za-z0-9_\-]{8,}\b|"
+    r"\b[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=\s*[^\s]+",
+    re.IGNORECASE,
+)
+RAW_LOG_RE = re.compile(
+    r"\b(raw[_-]?log|aggregated_output|stdout|stderr|traceback|exception stack)\b",
+    re.IGNORECASE,
+)
 
 
 def _strip_ansi(text: str) -> str:
@@ -70,6 +90,32 @@ def _is_source_like(line: str) -> bool:
 
 def _is_diff_like(line: str) -> bool:
     return bool(DIFF_LINE_RE.match(_strip_ansi(line).rstrip("\r")))
+
+
+def _review_prompt_packet_violations(prompt: str) -> list[str]:
+    return validate_text_packet(
+        prompt or "",
+        limits=PacketLimits(max_chars=_MAX_REVIEW_PROMPT_PACKET_CHARS, max_lines=_MAX_REVIEW_PROMPT_PACKET_LINES),
+        too_large_code="review_prompt_packet_too_large",
+        too_many_lines_code="review_prompt_packet_too_many_lines",
+    )
+
+
+def _review_packet_file_violations(packet: str) -> list[str]:
+    violations = validate_text_packet(
+        packet or "",
+        limits=PacketLimits(max_chars=_MAX_REVIEW_PACKET_CHARS, max_lines=_MAX_REVIEW_PACKET_LINES),
+        too_large_code="review_packet_too_large",
+        too_many_lines_code="review_packet_too_many_lines",
+    )
+    lines = (packet or "").splitlines()
+    if any(_is_diff_like(line) for line in lines):
+        violations.append("raw_diff_or_patch_marker")
+    if RAW_LOG_RE.search(packet or ""):
+        violations.append("raw_log_marker")
+    if SECRET_RE.search(packet or ""):
+        violations.append("secret_marker")
+    return sorted(set(violations))
 
 
 def _iter_json_text_fields(
@@ -345,6 +391,14 @@ def run(argv: list[str] | None = None) -> int:
     prompt = args.prompt
     if args.prompt_file:
         prompt = Path(args.prompt_file).read_text(encoding="utf-8", errors="replace")
+    prompt_violations = _review_prompt_packet_violations(prompt or "")
+    if prompt_violations:
+        return _emit({
+            "status": "unusable",
+            "reason": "unsafe_review_prompt_packet",
+            "review_prompt_packet_violations": prompt_violations,
+            "next_action": "provide_minimal_review_prompt_and_bounded_review_packet",
+        })
     if args.review_packet_file:
         packet_path = Path(args.review_packet_file).resolve()
         if not packet_path.exists():
@@ -354,6 +408,14 @@ def run(argv: list[str] | None = None) -> int:
                 "review_packet_file": str(packet_path),
             })
         packet = packet_path.read_text(encoding="utf-8", errors="replace")
+        packet_violations = _review_packet_file_violations(packet)
+        if packet_violations:
+            return _emit({
+                "status": "unusable",
+                "reason": "unsafe_review_packet_file",
+                "review_packet_violations": packet_violations,
+                "next_action": "provide_structured_summary_without_raw_diff_logs_or_secrets",
+            })
         prompt = _packet_review_prompt(prompt or "", packet)
 
     guard_dir = Path(tempfile.mkdtemp(prefix="codex-review-guard-"))

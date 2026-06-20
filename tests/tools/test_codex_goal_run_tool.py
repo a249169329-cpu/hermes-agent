@@ -63,7 +63,6 @@ def test_schema_registration_and_toolset_exposure():
         "stop_conditions",
         "mode",
         "dirty_baseline_policy",
-        "allow_isolated_worktree",
         "goal_artifact_dir",
         "rich_goal_file",
         "one_line_goal_file",
@@ -71,9 +70,18 @@ def test_schema_registration_and_toolset_exposure():
         "timeout_seconds",
         "monitor_interval_seconds",
         "max_wait_windows",
-        "standing_authorization",
     ]:
         assert field in props
+    for runtime_only_field in (
+        "allow_isolated_worktree",
+        "standing_authorization",
+        "allow_real_adapter",
+        "review_runner_enabled",
+        "allow_real_review",
+        "review_guard_enabled",
+        "review_guard_subprocess_enabled",
+    ):
+        assert runtime_only_field not in props
     assert schema["parameters"]["required"] == [
         "workdir",
         "stage_id",
@@ -89,27 +97,26 @@ def test_schema_registration_and_toolset_exposure():
         "collect_candidate",
         "review_candidate",
     ]
-    assert props["standing_authorization"]["type"] == "boolean"
     assert "codex_goal_run" in toolsets._HERMES_CORE_TOOLS
     assert toolsets.TOOLSETS["codex_goal_run"]["tools"] == ["codex_goal_run"]
 
 
-def test_schema_exposes_monitor_adapter_gating_fields():
+def test_schema_exposes_monitor_adapter_non_authorization_fields():
     schema = registry.get_schema("codex_goal_run")
     props = schema["parameters"]["properties"]
 
     assert props["adapter_enabled"]["type"] == "boolean"
-    assert props["allow_real_adapter"]["type"] == "boolean"
+    assert "allow_real_adapter" not in props
 
 
-def test_schema_exposes_review_candidate_replay_gating_fields():
+def test_schema_exposes_review_candidate_replay_but_not_runtime_authorization_fields():
     schema = registry.get_schema("codex_goal_run")
     props = schema["parameters"]["properties"]
 
-    assert props["review_runner_enabled"]["type"] == "boolean"
-    assert props["allow_real_review"]["type"] == "boolean"
-    assert props["review_guard_enabled"]["type"] == "boolean"
-    assert props["review_guard_subprocess_enabled"]["type"] == "boolean"
+    assert "review_runner_enabled" not in props
+    assert "allow_real_review" not in props
+    assert "review_guard_enabled" not in props
+    assert "review_guard_subprocess_enabled" not in props
     assert props["review_replay"]["type"] == "object"
 
 
@@ -1221,6 +1228,24 @@ def test_prepare_goal_rejects_artifact_dir_inside_repo(tmp_path, monkeypatch):
     assert _git(repo, "status", "--porcelain") == ""
 
 
+def test_prepare_goal_rejects_verbose_hermes_context_before_writing_artifacts(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    artifact_dir = tmp_path / "goal-artifacts"
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+
+    result = _call(
+        repo,
+        mode="prepare_goal",
+        goal_artifact_dir=str(artifact_dir),
+        objective="MEMORY (your personal notes) [99%] USER PROFILE (who the user is) Task: update README",
+    )
+
+    assert result["status"] == "unsafe_goal_packet"
+    assert "hermes_or_session_transcript_marker" in result["goal_packet_violations"]
+    assert result["goal_files"] == {}
+    assert not artifact_dir.exists()
+
+
 def test_prepare_goal_rejects_artifact_dir_outside_tmp(tmp_path, monkeypatch):
     repo = _clean_repo(tmp_path)
     fake_tmp_root = tmp_path / "allowed-tmp-root"
@@ -2179,6 +2204,21 @@ def test_launch_goal_rejects_missing_or_multiline_goal_before_tui_launch(tmp_pat
     extra_blank.write_text("/goal first line\n\n", encoding="utf-8")
     extra = json.loads(tool.codex_goal_run(_args(repo, mode="launch_goal", one_line_goal_file=str(extra_blank))))
     assert extra["status"] == "invalid_goal_text"
+    assert calls == []
+
+
+def test_launch_goal_rejects_verbose_hermes_context_before_tui_launch(tmp_path, monkeypatch):
+    repo = _clean_repo(tmp_path)
+    calls = []
+    one_line = tmp_path / "unsafe.goal.txt"
+    one_line.write_text("/goal MEMORY (your personal notes) [99%] Task: update README\n", encoding="utf-8")
+    monkeypatch.setattr(tool, "_codex_goals_preflight", lambda: {"status": "passed", "checks": {}, "blockers": []})
+    monkeypatch.setattr(tool, "_launch_goal_tui", lambda **kwargs: calls.append(kwargs), raising=False)
+
+    result = json.loads(tool.codex_goal_run(_args(repo, mode="launch_goal", one_line_goal_file=str(one_line))))
+
+    assert result["status"] == "unsafe_goal_packet"
+    assert "hermes_or_session_transcript_marker" in result["goal_packet_violations"]
     assert calls == []
 
 

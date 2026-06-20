@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from tools.codex_input_packet import CodexInputPacket, PacketLimits, render_codex_exec_prompt, validate_text_packet
 from tools.registry import registry
 
 
@@ -47,6 +48,8 @@ _PREVIEW_LIMIT = 8000
 _LIST_LIMIT = 200
 _DICT_LIMIT = 80
 _STRING_LIMIT = 4000
+_MAX_TASK_PACKET_CHARS = 6_000
+_MAX_TASK_PACKET_LINES = 80
 _DIRTY_PATHS_LIMIT = 100
 _DIFF_STAT_LINES_LIMIT = 40
 _DIFF_STAT_LINE_CHARS_LIMIT = 180
@@ -672,6 +675,15 @@ def _verify_none_high_risk(task: str) -> bool:
     return any(word in lowered for word in _HIGH_RISK_VERIFY_NONE_WORDS)
 
 
+def _task_packet_violations(task: str) -> list[str]:
+    return validate_text_packet(
+        task or "",
+        limits=PacketLimits(max_chars=_MAX_TASK_PACKET_CHARS, max_lines=_MAX_TASK_PACKET_LINES),
+        too_large_code="task_packet_too_large",
+        too_many_lines_code="task_packet_too_many_lines",
+    )
+
+
 def _runner_script() -> Path:
     return Path(__file__).resolve().parents[1] / "scripts" / "runtime" / "codex_stage_runner.py"
 
@@ -719,6 +731,45 @@ def _run_runner(argv: list[str], *, env: dict[str, str] | None = None) -> subpro
     )
 
 
+def _verification_steps(verify_ids: list[str]) -> list[str]:
+    if verify_ids == ["none"]:
+        return ["Hermes will verify the candidate diff after Codex stops."]
+    return ["git diff --check"]
+
+
+def _render_stage_codex_prompt(
+    *,
+    repo: Path,
+    task: str,
+    allowlist: dict[str, list[str]],
+    verify_ids: list[str],
+    continue_policy: str,
+    dirty_policy: str,
+) -> str:
+    packet = CodexInputPacket(
+        objective=task,
+        workdir=str(repo),
+        allowed_files=allowlist["files"],
+        allowed_globs=allowlist["globs"],
+        constraints=[
+            "Use only the allowed files/globs.",
+            f"continue_policy={continue_policy}",
+            f"dirty_baseline_policy={dirty_policy}",
+            "Do not commit, push, deploy, or restart.",
+        ],
+        verification=_verification_steps(verify_ids),
+        stop_conditions=[
+            "Stop after preparing a candidate diff for Hermes review.",
+            "Stop if the requested scope is insufficient or unsafe.",
+        ],
+        output_contract=[
+            "Return a concise summary and touched files only.",
+            "Do not print full diffs, raw logs, Hermes context, or secrets.",
+        ],
+    )
+    return render_codex_exec_prompt(packet)
+
+
 def _write_stage_files(
     *,
     repo: Path,
@@ -736,7 +787,17 @@ def _write_stage_files(
     raw_dir.mkdir(mode=0o700)
     plan_path = temp_root / "stage_plan.json"
     prompt_path = temp_root / "prompt.txt"
-    prompt_path.write_text(task, encoding="utf-8")
+    prompt_path.write_text(
+        _render_stage_codex_prompt(
+            repo=repo,
+            task=task,
+            allowlist=allowlist,
+            verify_ids=verify_ids,
+            continue_policy=continue_policy,
+            dirty_policy=dirty_policy,
+        ),
+        encoding="utf-8",
+    )
     plan = {
         "repo": str(repo),
         "continue_policy": continue_policy,
@@ -1031,6 +1092,7 @@ def _dry_run_contract_rejection(
     dirty_baseline_policy: str | None = None,
     dirty_check: dict[str, Any] | None = None,
     verification_policy: str | None = None,
+    **extra: Any,
 ) -> dict[str, Any]:
     empty_allowlist = {"files": [], "globs": []}
     return _base_result(
@@ -1047,6 +1109,7 @@ def _dry_run_contract_rejection(
         proposed_stage_plan=None,
         next_required_action=next_action,
         reason=reason,
+        **extra,
     )
 
 
@@ -1125,6 +1188,18 @@ def _codex_staged_dry_run_plan(args: dict[str, Any]) -> dict[str, Any]:
             verification_policy=verification_policy,
         )
     task_text = task.strip()
+    task_violations = _task_packet_violations(task_text)
+    if task_violations:
+        return _dry_run_contract_rejection(
+            reason="unsafe_task_packet",
+            next_action="provide_minimal_structured_task_packet",
+            resolved_workdir=resolved_workdir,
+            git_head=git_head,
+            dirty_baseline_policy=dirty_policy,
+            dirty_check=dirty_check,
+            verification_policy=verification_policy,
+            task_packet_violations=task_violations,
+        )
     if verify_ids == ["none"] and _verify_none_high_risk(task_text):
         return _dry_run_contract_rejection(
             reason="verify_none_high_risk_task",
@@ -1249,6 +1324,16 @@ def codex_staged_implement(args: dict[str, Any]) -> str:
     if not isinstance(task, str) or not task.strip():
         return _json_result(_base_result(status="rejected_scope"))
     task_text = task.strip()
+    task_violations = _task_packet_violations(task_text)
+    if task_violations:
+        return _json_result(
+            _base_result(
+                status="rejected_task_packet",
+                reason="unsafe_task_packet",
+                task_packet_violations=task_violations,
+                next_required_action="provide_minimal_structured_task_packet",
+            )
+        )
     if verify_ids == ["none"] and _verify_none_high_risk(task_text):
         return _json_result(_base_result(status="rejected_verify_policy", reason="verify_none_high_risk_task"))
 
@@ -1538,4 +1623,13 @@ registry.register(
     schema=_SCHEMA,
     handler=lambda args, **kwargs: codex_staged_implement(args),
     description=_SCHEMA["description"],
+    side_effects={
+        "class": "codex_candidate_workflow",
+        "scope": ["git_workdir", "codex_subprocess"],
+        "risk": "candidate_repo_write",
+        "may_write_files": True,
+        "may_spawn_codex": True,
+        "guarded": True,
+    },
+    artifact_outputs=[{"kind": "candidate_diff", "lifetime": "candidate"}],
 )
