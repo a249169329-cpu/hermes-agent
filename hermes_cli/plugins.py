@@ -329,6 +329,8 @@ class PluginContext:
         description: str = "",
         emoji: str = "",
         override: bool = False,
+        side_effects: dict | None = None,
+        artifact_outputs: list | None = None,
     ) -> None:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
@@ -350,6 +352,8 @@ class PluginContext:
             description=description,
             emoji=emoji,
             override=override,
+            side_effects=side_effects,
+            artifact_outputs=artifact_outputs,
         )
         self._manager._plugin_tool_names.add(name)
         logger.debug(

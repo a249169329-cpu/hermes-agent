@@ -43,19 +43,61 @@ from plugins.spotify.tools import (
 )
 
 _TOOLS = (
-    ("spotify_playback",  SPOTIFY_PLAYBACK_SCHEMA,  _handle_spotify_playback,  "🎵"),
-    ("spotify_devices",   SPOTIFY_DEVICES_SCHEMA,   _handle_spotify_devices,   "🔈"),
-    ("spotify_queue",     SPOTIFY_QUEUE_SCHEMA,     _handle_spotify_queue,     "📻"),
-    ("spotify_search",    SPOTIFY_SEARCH_SCHEMA,    _handle_spotify_search,    "🔎"),
-    ("spotify_playlists", SPOTIFY_PLAYLISTS_SCHEMA, _handle_spotify_playlists, "📚"),
-    ("spotify_albums",    SPOTIFY_ALBUMS_SCHEMA,    _handle_spotify_albums,    "💿"),
-    ("spotify_library",   SPOTIFY_LIBRARY_SCHEMA,   _handle_spotify_library,   "❤️"),
+    (
+        "spotify_playback",
+        SPOTIFY_PLAYBACK_SCHEMA,
+        _handle_spotify_playback,
+        "🎵",
+        {"class": "spotify_control", "may_access_network": True, "may_control_playback": True, "scope": ["spotify"]},
+    ),
+    (
+        "spotify_devices",
+        SPOTIFY_DEVICES_SCHEMA,
+        _handle_spotify_devices,
+        "🔈",
+        {"class": "spotify_control", "may_access_network": True, "may_modify_remote_state": True, "scope": ["spotify"]},
+    ),
+    (
+        "spotify_queue",
+        SPOTIFY_QUEUE_SCHEMA,
+        _handle_spotify_queue,
+        "📻",
+        {"class": "spotify_control", "may_access_network": True, "may_modify_remote_state": True, "scope": ["spotify"]},
+    ),
+    (
+        "spotify_search",
+        SPOTIFY_SEARCH_SCHEMA,
+        _handle_spotify_search,
+        "🔎",
+        {"class": "external_web_read", "may_access_network": True, "risk": "external_api_call", "scope": ["spotify"]},
+    ),
+    (
+        "spotify_playlists",
+        SPOTIFY_PLAYLISTS_SCHEMA,
+        _handle_spotify_playlists,
+        "📚",
+        {"class": "spotify_control", "may_access_network": True, "may_modify_remote_state": True, "scope": ["spotify"]},
+    ),
+    (
+        "spotify_albums",
+        SPOTIFY_ALBUMS_SCHEMA,
+        _handle_spotify_albums,
+        "💿",
+        {"class": "external_web_read", "may_access_network": True, "risk": "external_api_call", "scope": ["spotify"]},
+    ),
+    (
+        "spotify_library",
+        SPOTIFY_LIBRARY_SCHEMA,
+        _handle_spotify_library,
+        "❤️",
+        {"class": "spotify_control", "may_access_network": True, "may_modify_remote_state": True, "scope": ["spotify"]},
+    ),
 )
 
 
 def register(ctx) -> None:
     """Register all Spotify tools. Called once by the plugin loader."""
-    for name, schema, handler, emoji in _TOOLS:
+    for name, schema, handler, emoji, side_effects in _TOOLS:
         ctx.register_tool(
             name=name,
             toolset="spotify",
@@ -63,4 +105,6 @@ def register(ctx) -> None:
             handler=handler,
             check_fn=_check_spotify_available,
             emoji=emoji,
+            side_effects=side_effects,
+            artifact_outputs=[],
         )

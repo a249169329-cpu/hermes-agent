@@ -736,15 +736,24 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     return None
 
 
-def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
-    """Remove toolsets that contain only blocked tools."""
-    blocked_toolset_names = {
-        "delegation",
-        "clarify",
-        "memory",
-        "code_execution",
-    }
+def _strip_blocked_tools(toolsets: List[str], *, role: str = "leaf") -> List[str]:
+    """Remove explicitly blocked toolset names from child toolsets.
+
+    Composite toolsets are kept intact here.  Their blocked concrete tools are
+    removed by passing ``disabled_toolsets`` into the child AIAgent, which lets
+    model_tools subtract tools from composites without dropping safe tools that
+    do not have their own standalone toolset.
+    """
+    blocked_toolset_names = set(_child_disabled_toolsets(role))
     return [t for t in toolsets if t not in blocked_toolset_names]
+
+
+def _child_disabled_toolsets(role: str = "leaf") -> List[str]:
+    """Toolsets to subtract from the child after enabled toolsets resolve."""
+    disabled = ["clarify", "memory", "messaging", "code_execution"]
+    if role != "orchestrator":
+        disabled.insert(0, "delegation")
+    return disabled
 
 
 def _build_child_progress_callback(
@@ -1025,13 +1034,13 @@ def _build_child_agent(
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
-        child_toolsets = _strip_blocked_tools(child_toolsets)
+        child_toolsets = _strip_blocked_tools(child_toolsets, role=effective_role)
     elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
+        child_toolsets = _strip_blocked_tools(parent_enabled, role=effective_role)
     elif parent_toolsets:
-        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
+        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets), role=effective_role)
     else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS, role=effective_role)
 
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
@@ -1192,6 +1201,7 @@ def _build_child_agent(
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,
+        disabled_toolsets=_child_disabled_toolsets(effective_role),
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",

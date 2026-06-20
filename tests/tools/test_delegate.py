@@ -1635,6 +1635,53 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
             self.assertEqual(mock_child._credential_pool, mock_pool)
 
     @patch("tools.delegate_tool._load_config", return_value={})
+    def test_build_child_agent_leaf_composite_toolset_does_not_expose_blocked_tools(self, mock_cfg):
+        """Leaf subagents must not regain blocked tools through composite toolsets.
+
+        Posture/composite toolsets such as ``coding`` and ``hermes-cli``
+        resolve to individual tools including delegate_task, clarify, memory,
+        send_message, and execute_code.  The model-facing contract says leaf
+        children cannot call those tools, so _build_child_agent must pass
+        toolsets that resolve without them.
+        """
+        import model_tools
+
+        for composite_toolset in ("coding", "hermes-cli"):
+            with self.subTest(composite_toolset=composite_toolset):
+                parent = _make_mock_parent()
+                parent.enabled_toolsets = [composite_toolset]
+
+                with patch("run_agent.AIAgent") as MockAgent:
+                    mock_child = MagicMock()
+                    MockAgent.return_value = mock_child
+
+                    _build_child_agent(
+                        task_index=0,
+                        goal="Test composite toolset leaf scoping",
+                        context=None,
+                        toolsets=None,
+                        model=None,
+                        max_iterations=10,
+                        parent_agent=parent,
+                        task_count=1,
+                    )
+
+                child_kwargs = MockAgent.call_args[1]
+                child_toolsets = child_kwargs["enabled_toolsets"]
+                child_disabled = child_kwargs["disabled_toolsets"]
+                self.assertEqual(child_toolsets, [composite_toolset])
+                child_defs = model_tools.get_tool_definitions(
+                    child_toolsets,
+                    disabled_toolsets=child_disabled,
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                )
+                child_tool_names = {d["function"]["name"] for d in child_defs}
+                self.assertFalse(child_tool_names.intersection(DELEGATE_BLOCKED_TOOLS))
+                self.assertIn("terminal", child_tool_names)
+                self.assertIn("read_file", child_tool_names)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
     def test_build_child_agent_preserves_mcp_toolsets_by_default(self, mock_cfg):
         parent = _make_mock_parent()
         parent.enabled_toolsets = ["web", "browser", "mcp-MiniMax"]

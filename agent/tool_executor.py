@@ -237,6 +237,20 @@ def _run_agent_tool_execution_middleware(
         turn_id=getattr(agent, "_current_turn_id", "") or "",
         api_request_id=getattr(agent, "_current_api_request_id", "") or "",
     )
+    try:
+        from tools.tool_output_guard import sanitize_tool_result_for_model
+        result = sanitize_tool_result_for_model(function_name, result)
+    except Exception as exc:
+        logger.exception("agent executor tool output guard failed for %s: %s", function_name, exc)
+        result = json.dumps(
+            {
+                "error": "Tool output guard failed before returning agent executor result",
+                "status": "rejected_tool_output",
+                "reason": "tool_output_guard_failed",
+                "tool_name": function_name,
+            },
+            ensure_ascii=False,
+        )
     return result, observed_args
 
 

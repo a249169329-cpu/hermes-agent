@@ -53,6 +53,7 @@ from agent.video_gen_provider import (
     DEFAULT_RESOLUTION,
     error_response,
 )
+from tools.artifact_ledger import record_tool_artifact
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -390,6 +391,21 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
             model=model or "",
             prompt=prompt,
         ))
+
+    output_reference = result.get("video") or result.get("video_url") or result.get("output_path")
+    if isinstance(output_reference, str) and output_reference:
+        try:
+            artifact_id = record_tool_artifact(
+                source_tool="video_generate",
+                native_arguments={"prompt": prompt, **kwargs},
+                output_reference=output_reference,
+                kind="video",
+                lifetime="persistent_or_remote",
+            )
+            if artifact_id:
+                result.setdefault("artifact_id", artifact_id)
+        except Exception as exc:  # noqa: BLE001 - ledger failure must not break generation
+            logger.warning("Could not record video generation artifact: %s", exc)
 
     return json.dumps(result)
 

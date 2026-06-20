@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from hermes_constants import get_hermes_home
+from tools.tool_input_packet import CREDENTIAL_VALUE_RE, ToolInputPacket, packet_hash
 
 
 class ArtifactStatus(StrEnum):
@@ -140,3 +143,96 @@ class ArtifactLedger:
             encoding="utf-8",
         )
         return updated
+
+
+def looks_like_absolute_file_path(value: str) -> bool:
+    """Return True for local absolute paths without treating URLs as files."""
+    if not isinstance(value, str) or not value:
+        return False
+    if "://" in value:
+        return False
+    return Path(value).is_absolute()
+
+
+RAW_HTML_RE = re.compile(r"<\s*(?:!doctype\s+html|html|body|script|iframe|style)\b", re.IGNORECASE)
+DATA_URI_OR_BASE64_RE = re.compile(
+    r"\bdata:[^,;]+(?:;base64)?,|\bbase64\s*,|[A-Za-z0-9+/]{80,}={0,2}",
+    re.IGNORECASE,
+)
+URL_SECRET_RE = re.compile(
+    r"(?:[?&](?:token|access_token|api_key|apikey|secret|password|signature|sig)=)[^&#\s]+|"
+    r"^[a-z][a-z0-9+.-]*://[^/@\s]+:[^/@\s]+@",
+    re.IGNORECASE,
+)
+
+
+def validate_artifact_output_reference(output_reference: str) -> list[str]:
+    """Validate that an artifact reference is bounded and non-secret.
+
+    The ledger persists pointers to artifacts, not raw artifact bytes/source or
+    bearer/signed credentials embedded in those pointers.
+    """
+    if not isinstance(output_reference, str) or not output_reference.strip():
+        return ["missing_output_reference"]
+    value = output_reference.strip()
+    violations: list[str] = []
+    if len(value) > 2048:
+        violations.append("output_reference_too_large")
+    lowered = value.lower()
+    if lowered.startswith("data:") or DATA_URI_OR_BASE64_RE.search(value):
+        violations.append("data_uri_or_base64_output_reference")
+    if lowered.startswith("file://"):
+        violations.append("file_url_output_reference")
+    if RAW_HTML_RE.search(value):
+        violations.append("raw_html_output_reference")
+    if CREDENTIAL_VALUE_RE.search(value) or URL_SECRET_RE.search(value):
+        violations.append("secret_output_reference")
+    parsed = urlsplit(value)
+    if parsed.scheme and parsed.scheme not in {"http", "https"}:
+        violations.append("unsupported_output_reference_scheme")
+    return sorted(set(violations))
+
+
+def record_tool_artifact(
+    *,
+    source_tool: str,
+    native_arguments: dict[str, Any],
+    output_reference: str,
+    kind: str | None = None,
+    lifetime: str = "persistent_or_remote",
+    ledger_path: str | Path | None = None,
+) -> str | None:
+    """Record a generated artifact and return its stable artifact id.
+
+    Stores only a bounded artifact reference plus verification metadata, never
+    raw artifact bytes/content.
+    """
+    if not isinstance(output_reference, str) or not output_reference:
+        return None
+    if validate_artifact_output_reference(output_reference):
+        return None
+    packet = ToolInputPacket(
+        tool_name=source_tool,
+        intent=f"Record artifact output from {source_tool}",
+        native_arguments=native_arguments if isinstance(native_arguments, dict) else {},
+    )
+    input_hash = packet_hash(packet)
+    artifact_id = make_artifact_id(source_tool, input_hash, output_reference)
+    is_file = looks_like_absolute_file_path(output_reference)
+    verification: dict[str, Any] = {
+        "exists": Path(output_reference).exists(),
+    } if is_file else {"remote": True}
+    if kind:
+        verification["kind"] = kind
+    record = ArtifactRecord(
+        artifact_id=artifact_id,
+        source_tool=source_tool,
+        input_packet_hash=input_hash,
+        output_path=output_reference if is_file else None,
+        output_url=output_reference if not is_file else None,
+        verification=verification,
+        status=ArtifactStatus.ACCEPTED,
+        lifetime=lifetime,
+    )
+    ArtifactLedger(ledger_path or default_artifact_ledger_path()).append(record)
+    return artifact_id

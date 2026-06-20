@@ -888,6 +888,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    runtime_authorization: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -992,6 +993,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                runtime_authorization=runtime_authorization,
             )
 
     _tool_original_args = dict(function_args)
@@ -1015,6 +1017,73 @@ def handle_function_call(
             logger.debug("tool_request middleware error: %s", _mw_err)
 
     try:
+        try:
+            from tools.tool_boundary import guard_tool_input
+            boundary_rejection = guard_tool_input(function_name, function_args)
+        except Exception as _boundary_err:
+            logger.exception("tool input boundary failed for %s: %s", function_name, _boundary_err)
+            boundary_rejection = json.dumps(
+                {
+                    "error": "Tool input boundary failed before dispatch",
+                    "status": "rejected_tool_input_packet",
+                    "reason": "tool_input_boundary_failed",
+                    "tool_name": function_name,
+                },
+                ensure_ascii=False,
+            )
+        if boundary_rejection is not None:
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=boundary_rejection,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                status="blocked",
+                error_type="tool_input_boundary",
+                error_message="unsafe_tool_input_packet",
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return boundary_rejection
+
+        try:
+            from tools.side_effect_policy import guard_side_effect_policy
+            side_effect_rejection = guard_side_effect_policy(
+                function_name,
+                function_args,
+                runtime_authorization=runtime_authorization,
+                tool_call_id=tool_call_id,
+            )
+        except Exception as _side_effect_err:
+            logger.exception("side-effect policy guard failed for %s: %s", function_name, _side_effect_err)
+            side_effect_rejection = json.dumps(
+                {
+                    "error": "Side-effect policy guard failed before dispatch",
+                    "status": "rejected_side_effect_policy",
+                    "reason": "side_effect_policy_guard_failed",
+                    "tool_name": function_name,
+                },
+                ensure_ascii=False,
+            )
+        if side_effect_rejection is not None:
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=side_effect_rejection,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                status="blocked",
+                error_type="side_effect_policy",
+                error_message="runtime_authorization_required",
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return side_effect_rejection
+
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
@@ -1191,6 +1260,21 @@ def handle_function_call(
                         break
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
+
+        try:
+            from tools.tool_output_guard import sanitize_tool_result_for_model
+            result = sanitize_tool_result_for_model(function_name, result)
+        except Exception as _output_guard_err:
+            logger.exception("tool output guard failed for %s: %s", function_name, _output_guard_err)
+            result = json.dumps(
+                {
+                    "error": "Tool output guard failed before returning result",
+                    "status": "rejected_tool_output",
+                    "reason": "tool_output_guard_failed",
+                    "tool_name": function_name,
+                },
+                ensure_ascii=False,
+            )
 
         return result
 

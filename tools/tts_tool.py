@@ -69,6 +69,7 @@ def get_env_value(name, default=None):
     value = _get_env_value(name)
     return default if value is None else value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from tools.artifact_ledger import record_tool_artifact
 from tools.tool_backend_helpers import (
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
@@ -905,7 +906,7 @@ def _convert_to_opus(mp3_path: str) -> Optional[str]:
             stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
-            logger.warning("ffmpeg conversion failed with return code %d: %s", 
+            logger.warning("ffmpeg conversion failed with return code %d: %s",
                           result.returncode, result.stderr.decode('utf-8', errors='ignore')[:200])
             return None
         if os.path.exists(ogg_path) and os.path.getsize(ogg_path) > 0:
@@ -2302,13 +2303,27 @@ def text_to_speech_tool(
         if voice_compatible:
             media_tag = f"[[audio_as_voice]]\n{media_tag}"
 
-        return json.dumps({
+        payload = {
             "success": True,
             "file_path": file_str,
             "media_tag": media_tag,
             "provider": provider,
             "voice_compatible": voice_compatible,
-        }, ensure_ascii=False)
+        }
+        try:
+            artifact_id = record_tool_artifact(
+                source_tool="text_to_speech",
+                native_arguments={"text": text, "output_path": output_path or "", "provider": provider},
+                output_reference=file_str,
+                kind="audio",
+                lifetime="persistent_or_remote",
+            )
+            if artifact_id:
+                payload.setdefault("artifact_id", artifact_id)
+        except Exception as exc:  # noqa: BLE001 - ledger failure must not break TTS
+            logger.warning("Could not record TTS artifact: %s", exc)
+
+        return json.dumps(payload, ensure_ascii=False)
 
     except ValueError as e:
         # Configuration errors (missing API keys, etc.)
