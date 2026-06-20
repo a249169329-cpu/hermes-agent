@@ -1,11 +1,93 @@
 """Tests for the central tool registry."""
 
+import ast
+import importlib
 import json
 import threading
 from pathlib import Path
 from unittest.mock import patch
 
 from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
+
+
+_FIRST_BATCH_GOVERNANCE_MODULES = (
+    "tools.file_tools",
+    "tools.terminal_tool",
+    "tools.process_registry",
+    "tools.browser_tool",
+    "tools.image_generation_tool",
+    "tools.delegate_tool",
+    "tools.codex_workflow_run_tool",
+    "tools.codex_staged_implement_tool",
+    "tools.codex_goal_run_tool",
+)
+
+_FIRST_BATCH_GOVERNANCE_TOOLS = {
+    "read_file": ("read_filesystem", set()),
+    "search_files": ("read_filesystem", set()),
+    "write_file": ("write_filesystem", {"file"}),
+    "patch": ("write_filesystem", {"file", "diff"}),
+    "terminal": ("execute_shell", {"command_output", "background_process"}),
+    "process": ("manage_process", {"process_log"}),
+    "browser_navigate": ("browser_navigation", {"browser_state"}),
+    "browser_snapshot": ("read_browser_state", {"browser_snapshot"}),
+    "browser_click": ("browser_interaction", {"browser_state"}),
+    "browser_type": ("browser_interaction", {"browser_state"}),
+    "browser_scroll": ("browser_interaction", {"browser_state"}),
+    "browser_back": ("browser_navigation", {"browser_state"}),
+    "browser_press": ("browser_interaction", {"browser_state"}),
+    "browser_get_images": ("read_browser_state", {"image_reference"}),
+    "browser_vision": ("read_browser_state", {"browser_screenshot"}),
+    "browser_console": ("browser_interaction", {"browser_state", "console_output"}),
+    "image_generate": ("generate_media", {"image"}),
+    "delegate_task": ("spawn_subagent", {"subagent_summary"}),
+    "codex_workflow_run": ("codex_candidate_workflow", {"candidate_diff", "review_summary"}),
+    "codex_staged_implement": ("codex_candidate_workflow", {"candidate_diff"}),
+    "codex_goal_run": ("codex_goal_workflow", {"goal_artifact", "review_summary"}),
+}
+
+
+def _load_first_batch_governance_tools():
+    for module_name in _FIRST_BATCH_GOVERNANCE_MODULES:
+        importlib.import_module(module_name)
+    from tools.registry import registry
+
+    return registry
+
+
+def _artifact_kinds(metadata):
+    return {item.get("kind") for item in metadata["artifact_outputs"]}
+
+
+def _registry_register_calls_missing_governance_metadata():
+    tools_dir = Path(__file__).resolve().parents[2] / "tools"
+    missing = []
+    for path in sorted(tools_dir.rglob("*.py")):
+        if path.name == "registry.py" or "__pycache__" in path.parts:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (
+                isinstance(func, ast.Attribute)
+                and func.attr == "register"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "registry"
+            ):
+                continue
+            keywords = {kw.arg for kw in node.keywords if kw.arg}
+            if {"side_effects", "artifact_outputs"} <= keywords:
+                continue
+            missing.append(
+                f"{path.relative_to(tools_dir.parent)}:{node.lineno}: "
+                f"missing {sorted({'side_effects', 'artifact_outputs'} - keywords)}"
+            )
+    return missing
 
 
 def _dummy_handler(args, **kwargs):
@@ -396,6 +478,89 @@ class TestEntryLookup:
     def test_get_entry_returns_none_for_unknown_tool(self):
         reg = ToolRegistry()
         assert reg.get_entry("missing") is None
+
+
+class TestToolGovernanceMetadata:
+    def test_all_builtin_register_calls_declare_governance_metadata(self):
+        assert _registry_register_calls_missing_governance_metadata() == []
+
+    def test_default_governance_metadata_is_unknown_and_internal_only(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="alpha", toolset="core", schema=_make_schema("alpha"), handler=_dummy_handler
+        )
+
+        metadata = reg.get_tool_governance_metadata("alpha")
+        defs = reg.get_definitions({"alpha"})
+        fn_schema = defs[0]["function"]
+
+        assert metadata == {"side_effects": {"class": "unknown"}, "artifact_outputs": []}
+        assert "side_effects" not in fn_schema
+        assert "artifact_outputs" not in fn_schema
+
+    def test_registered_governance_metadata_is_stored_as_defensive_copy(self):
+        reg = ToolRegistry()
+        side_effects = {
+            "class": "write_repo",
+            "writes": ["repo"],
+            "requires_approval": True,
+        }
+        artifact_outputs = [{"kind": "diff", "lifetime": "candidate"}]
+        reg.register(
+            name="writer",
+            toolset="core",
+            schema=_make_schema("writer"),
+            handler=_dummy_handler,
+            side_effects=side_effects,
+            artifact_outputs=artifact_outputs,
+        )
+
+        side_effects["class"] = "mutated"
+        artifact_outputs.append({"kind": "unexpected"})
+
+        metadata = reg.get_tool_governance_metadata("writer")
+        all_metadata = reg.get_all_tool_governance_metadata()
+        defs = reg.get_definitions({"writer"})
+        fn_schema = defs[0]["function"]
+
+        assert metadata == {
+            "side_effects": {
+                "class": "write_repo",
+                "writes": ["repo"],
+                "requires_approval": True,
+            },
+            "artifact_outputs": [{"kind": "diff", "lifetime": "candidate"}],
+        }
+        assert all_metadata["writer"] == metadata
+        assert "side_effects" not in fn_schema
+        assert "artifact_outputs" not in fn_schema
+
+    def test_unknown_tool_governance_metadata_is_none(self):
+        reg = ToolRegistry()
+        assert reg.get_tool_governance_metadata("missing") is None
+
+    def test_first_batch_builtin_tools_declares_governance_metadata(self):
+        reg = _load_first_batch_governance_tools()
+
+        for tool_name, (expected_class, expected_artifacts) in _FIRST_BATCH_GOVERNANCE_TOOLS.items():
+            metadata = reg.get_tool_governance_metadata(tool_name)
+
+            assert metadata is not None, tool_name
+            assert metadata["side_effects"]["class"] == expected_class, tool_name
+            assert metadata["side_effects"].get("scope"), tool_name
+            assert expected_artifacts <= _artifact_kinds(metadata), tool_name
+
+    def test_first_batch_governance_metadata_does_not_leak_to_model_schema(self):
+        reg = _load_first_batch_governance_tools()
+        with patch("tools.registry._check_fn_cached", return_value=True):
+            defs = reg.get_definitions(set(_FIRST_BATCH_GOVERNANCE_TOOLS), quiet=True)
+        by_name = {item["function"]["name"]: item["function"] for item in defs}
+
+        assert set(_FIRST_BATCH_GOVERNANCE_TOOLS) <= set(by_name)
+        for tool_name in _FIRST_BATCH_GOVERNANCE_TOOLS:
+            fn_schema = by_name[tool_name]
+            assert "side_effects" not in fn_schema
+            assert "artifact_outputs" not in fn_schema
 
 
 class TestSecretCaptureResultContract:

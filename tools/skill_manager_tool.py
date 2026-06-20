@@ -1151,4 +1151,6 @@ registry.register(
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into")),
     emoji="📝",
+    side_effects={'class': 'manage_skills', 'may_write_files': True, 'risk': 'persistent_context_write', 'scope': ['skills_directory']},
+    artifact_outputs=[{'kind': 'skill_file', 'lifetime': 'tool_result'}, {'kind': 'diff', 'lifetime': 'tool_result'}],
 )

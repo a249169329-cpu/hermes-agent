@@ -1225,6 +1225,8 @@ registry.register(
     check_fn=check_vision_requirements,
     is_async=True,
     emoji="👁️",
+    side_effects={'class': 'analyze_media', 'may_access_network': True, 'risk': 'external_api_call', 'scope': ['vision_provider']},
+    artifact_outputs=[{'kind': 'vision_analysis', 'lifetime': 'tool_result'}],
 )
 
 
@@ -1588,4 +1590,6 @@ registry.register(
     check_fn=check_vision_requirements,
     is_async=True,
     emoji="🎬",
+    side_effects={'class': 'analyze_media', 'may_access_network': True, 'risk': 'external_api_call', 'scope': ['vision_provider']},
+    artifact_outputs=[{'kind': 'video_analysis', 'lifetime': 'tool_result'}],
 )

@@ -2758,7 +2758,12 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
 
 
 
-def browser_console(clear: bool = False, expression: Optional[str] = None, task_id: Optional[str] = None) -> str:
+def browser_console(
+    clear: bool = False,
+    expression: Optional[str] = None,
+    task_id: Optional[str] = None,
+    permission_tier: Optional[str] = None,
+) -> str:
     """Get browser console messages and JavaScript errors, or evaluate JS in the page.
 
     When ``expression`` is provided, evaluates JavaScript in the page context
@@ -2775,6 +2780,20 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     """
     # --- JS evaluation mode ---
     if expression is not None:
+        from tools.browser_ui_contract import (
+            browser_permission_allows,
+            classify_console_expression,
+        )
+
+        required_tier = classify_console_expression(expression)
+        if not browser_permission_allows(required_tier, permission_tier):
+            return tool_error(
+                "browser console expression requires explicit permission tier",
+                success=False,
+                error_type="browser_permission_guard",
+                required_permission=required_tier.name,
+                granted_permission=permission_tier or "cdp_read",
+            )
         return _browser_eval(expression, task_id)
 
     # --- Console output mode (original behaviour) ---
@@ -3796,6 +3815,13 @@ registry.register(
     handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🌐",
+    side_effects={
+        "class": "browser_navigation",
+        "scope": ["browser_session"],
+        "risk": "network_navigation",
+        "may_access_network": True,
+    },
+    artifact_outputs=[{"kind": "browser_state", "lifetime": "session"}],
 )
 registry.register(
     name="browser_snapshot",
@@ -3805,6 +3831,12 @@ registry.register(
         full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
     check_fn=check_browser_requirements,
     emoji="📸",
+    side_effects={
+        "class": "read_browser_state",
+        "scope": ["browser_session"],
+        "risk": "read_only",
+    },
+    artifact_outputs=[{"kind": "browser_snapshot", "lifetime": "tool_result"}],
 )
 registry.register(
     name="browser_click",
@@ -3813,6 +3845,13 @@ registry.register(
     handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="👆",
+    side_effects={
+        "class": "browser_interaction",
+        "scope": ["browser_session"],
+        "risk": "web_interaction",
+        "may_submit_or_click": True,
+    },
+    artifact_outputs=[{"kind": "browser_state", "lifetime": "session"}],
 )
 registry.register(
     name="browser_type",
@@ -3821,6 +3860,13 @@ registry.register(
     handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="⌨️",
+    side_effects={
+        "class": "browser_interaction",
+        "scope": ["browser_session"],
+        "risk": "web_interaction",
+        "may_type_text": True,
+    },
+    artifact_outputs=[{"kind": "browser_state", "lifetime": "session"}],
 )
 registry.register(
     name="browser_scroll",
@@ -3829,6 +3875,12 @@ registry.register(
     handler=lambda args, **kw: browser_scroll(direction=args.get("direction", "down"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="📜",
+    side_effects={
+        "class": "browser_interaction",
+        "scope": ["browser_session"],
+        "risk": "web_interaction",
+    },
+    artifact_outputs=[{"kind": "browser_state", "lifetime": "session"}],
 )
 registry.register(
     name="browser_back",
@@ -3837,6 +3889,12 @@ registry.register(
     handler=lambda args, **kw: browser_back(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="◀️",
+    side_effects={
+        "class": "browser_navigation",
+        "scope": ["browser_session"],
+        "risk": "network_navigation",
+    },
+    artifact_outputs=[{"kind": "browser_state", "lifetime": "session"}],
 )
 registry.register(
     name="browser_press",
@@ -3845,6 +3903,13 @@ registry.register(
     handler=lambda args, **kw: browser_press(key=args.get("key", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="⌨️",
+    side_effects={
+        "class": "browser_interaction",
+        "scope": ["browser_session"],
+        "risk": "web_interaction",
+        "may_press_key": True,
+    },
+    artifact_outputs=[{"kind": "browser_state", "lifetime": "session"}],
 )
 
 registry.register(
@@ -3854,6 +3919,12 @@ registry.register(
     handler=lambda args, **kw: browser_get_images(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🖼️",
+    side_effects={
+        "class": "read_browser_state",
+        "scope": ["browser_session"],
+        "risk": "read_only",
+    },
+    artifact_outputs=[{"kind": "image_reference", "lifetime": "tool_result"}],
 )
 registry.register(
     name="browser_vision",
@@ -3862,12 +3933,28 @@ registry.register(
     handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
     check_fn=check_browser_vision_requirements,
     emoji="👁️",
+    side_effects={
+        "class": "read_browser_state",
+        "scope": ["browser_session"],
+        "risk": "read_only",
+    },
+    artifact_outputs=[{"kind": "browser_screenshot", "lifetime": "tool_result"}],
 )
 registry.register(
     name="browser_console",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_console"],
-    handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id"), permission_tier=kw.get("permission_tier")),
     check_fn=check_browser_requirements,
     emoji="🖥️",
+    side_effects={
+        "class": "browser_interaction",
+        "scope": ["browser_session"],
+        "risk": "web_interaction",
+        "may_execute_javascript": True,
+    },
+    artifact_outputs=[
+        {"kind": "browser_state", "lifetime": "session"},
+        {"kind": "console_output", "lifetime": "tool_result"},
+    ],
 )

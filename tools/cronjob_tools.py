@@ -893,4 +893,6 @@ registry.register(
     ))(),
     check_fn=check_cronjob_requirements,
     emoji="⏰",
+    side_effects={'class': 'manage_schedule', 'may_deliver_messages': True, 'may_schedule_jobs': True, 'may_write_files': True, 'risk': 'scheduled_side_effect', 'scope': ['scheduler']},
+    artifact_outputs=[{'kind': 'cron_job', 'lifetime': 'tool_result'}],
 )

@@ -539,4 +539,6 @@ registry.register(
     requires_env=["OPENROUTER_API_KEY"],
     is_async=True,
     emoji="🧠",
+    side_effects={'class': 'spawn_subagent', 'may_access_network': True, 'risk': 'delegated_model_use', 'scope': ['child_agent_session']},
+    artifact_outputs=[{'kind': 'agent_synthesis', 'lifetime': 'tool_result'}],
 )

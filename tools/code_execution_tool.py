@@ -1829,4 +1829,6 @@ registry.register(
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,
+    side_effects={'class': 'execute_python_sandbox', 'may_access_network': True, 'may_call_tools': True, 'may_write_files': True, 'risk': 'code_execution', 'scope': ['agent_sandbox']},
+    artifact_outputs=[{'kind': 'script_output', 'lifetime': 'tool_result'}],
 )

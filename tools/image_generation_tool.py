@@ -689,8 +689,48 @@ def _force_artifact_sync(env: Any) -> None:
         logger.warning("Could not force-sync generated image artifact: %s", exc)
 
 
-def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> str:
-    """Annotate successful local image results with backend-visible paths.
+def _record_image_generate_artifact(
+    payload: dict[str, Any],
+    *,
+    prompt: str | None,
+    aspect_ratio: str | None,
+) -> None:
+    image = payload.get("image") or payload.get("agent_visible_image") or payload.get("host_image")
+    if not isinstance(image, str) or not image:
+        return
+    try:
+        packet = ToolInputPacket(
+            tool_name="image_generate",
+            intent="Generate image",
+            native_arguments={"prompt": prompt or "", "aspect_ratio": aspect_ratio or DEFAULT_ASPECT_RATIO},
+        )
+        input_hash = packet_hash(packet)
+        artifact_id = make_artifact_id("image_generate", input_hash, image)
+        is_file = _looks_like_absolute_file_path(image)
+        record = ArtifactRecord(
+            artifact_id=artifact_id,
+            source_tool="image_generate",
+            input_packet_hash=input_hash,
+            output_path=image if is_file else None,
+            output_url=image if not is_file else None,
+            verification={"exists": os.path.exists(image)} if is_file else {"remote": True},
+            status=ArtifactStatus.ACCEPTED,
+            lifetime="persistent_or_remote",
+        )
+        ArtifactLedger(default_artifact_ledger_path()).append(record)
+        payload.setdefault("artifact_id", artifact_id)
+    except Exception as exc:  # noqa: BLE001 - artifact ledger must not break image generation
+        logger.warning("Could not record image generation artifact: %s", exc)
+
+
+def _postprocess_image_generate_result(
+    raw: str,
+    task_id: str | None = None,
+    *,
+    prompt: str | None = None,
+    aspect_ratio: str | None = None,
+) -> str:
+    """Annotate successful image results and record them in the artifact ledger.
 
     ``image`` remains the host/gateway-deliverable path.  When the active
     terminal backend has a different filesystem, ``agent_visible_image`` gives
@@ -706,18 +746,18 @@ def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> 
 
     image = payload.get("image")
     if not isinstance(image, str) or not _looks_like_absolute_file_path(image):
-        return raw
+        _record_image_generate_artifact(payload, prompt=prompt, aspect_ratio=aspect_ratio)
+        return json.dumps(payload, ensure_ascii=False)
 
     env = _active_terminal_env(task_id)
     agent_path = _agent_visible_cache_path(image, env)
-    if not agent_path or agent_path == image:
-        return raw
+    if agent_path and agent_path != image:
+        if env is not None:
+            _force_artifact_sync(env)
+        payload.setdefault("host_image", image)
+        payload.setdefault("agent_visible_image", agent_path)
 
-    if env is not None:
-        _force_artifact_sync(env)
-
-    payload.setdefault("host_image", image)
-    payload.setdefault("agent_visible_image", agent_path)
+    _record_image_generate_artifact(payload, prompt=prompt, aspect_ratio=aspect_ratio)
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -997,7 +1037,16 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+from tools.artifact_ledger import (
+    ArtifactLedger,
+    ArtifactRecord,
+    ArtifactStatus,
+    default_artifact_ledger_path,
+    make_artifact_id,
+)
+from tools.image_prompt_guard import ImagePromptRequest, validate_image_prompt_request
 from tools.registry import registry, tool_error
+from tools.tool_input_packet import ToolInputPacket, packet_hash
 
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
@@ -1428,18 +1477,44 @@ def _handle_image_generate(args, **kw):
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
     task_id = kw.get("task_id")
+    guard_violations = validate_image_prompt_request(
+        ImagePromptRequest(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            # The public image_generate schema is text-to-image only today;
+            # there are no input file paths to validate on this handler path.
+            require_existing_input_files=False,
+        )
+    )
+    if guard_violations:
+        return tool_error(
+            "image prompt rejected by guard",
+            success=False,
+            error_type="image_prompt_guard",
+            violations=guard_violations,
+        )
 
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
     dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
     if dispatched is not None:
-        return _postprocess_image_generate_result(dispatched, task_id=task_id)
+        return _postprocess_image_generate_result(
+            dispatched,
+            task_id=task_id,
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+        )
 
     raw = image_generate_tool(
         prompt=prompt,
         aspect_ratio=aspect_ratio,
     )
-    return _postprocess_image_generate_result(raw, task_id=task_id)
+    return _postprocess_image_generate_result(
+        raw,
+        task_id=task_id,
+        prompt=prompt,
+        aspect_ratio=aspect_ratio,
+    )
 
 
 registry.register(
@@ -1451,4 +1526,12 @@ registry.register(
     requires_env=[],
     is_async=False,   # sync fal_client API to avoid "Event loop is closed" in gateway
     emoji="🎨",
+    side_effects={
+        "class": "generate_media",
+        "scope": ["external_image_provider", "local_media_cache"],
+        "risk": "external_api_call",
+        "may_write_files": True,
+        "may_access_network": True,
+    },
+    artifact_outputs=[{"kind": "image", "lifetime": "persistent_or_remote"}],
 )

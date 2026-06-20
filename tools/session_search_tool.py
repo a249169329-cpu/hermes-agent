@@ -1219,4 +1219,6 @@ registry.register(
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",
+    side_effects={'class': 'read_session_history', 'risk': 'read_only', 'scope': ['session_database']},
+    artifact_outputs=[{'kind': 'session_results', 'lifetime': 'tool_result'}],
 )

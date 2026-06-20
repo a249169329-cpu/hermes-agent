@@ -1894,4 +1894,6 @@ registry.register(
     handler=send_message_tool,
     check_fn=_check_send_message,
     emoji="📨",
+    side_effects={'class': 'external_message_send', 'may_access_network': True, 'may_send_messages': True, 'risk': 'external_api_call', 'scope': ['messaging_platform']},
+    artifact_outputs=[{'kind': 'message_delivery', 'lifetime': 'tool_result'}],
 )

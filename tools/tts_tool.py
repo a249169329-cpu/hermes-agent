@@ -2728,4 +2728,6 @@ registry.register(
         output_path=args.get("output_path")),
     check_fn=check_tts_requirements,
     emoji="🔊",
+    side_effects={'class': 'generate_audio', 'may_access_network': True, 'may_write_files': True, 'risk': 'external_api_call', 'scope': ['tts_provider', 'local_audio_cache']},
+    artifact_outputs=[{'kind': 'audio', 'lifetime': 'persistent_or_remote'}],
 )

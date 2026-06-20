@@ -522,4 +522,6 @@ registry.register(
     requires_env=["XAI_API_KEY"],
     emoji="🐦",
     max_result_size_chars=100_000,
+    side_effects={'class': 'external_web_read', 'may_access_network': True, 'risk': 'external_api_call', 'scope': ['x_search_provider']},
+    artifact_outputs=[{'kind': 'x_search_results', 'lifetime': 'tool_result'}],
 )

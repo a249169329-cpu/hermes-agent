@@ -305,4 +305,6 @@ registry.register(
         todos=args.get("todos"), merge=args.get("merge", False), store=kw.get("store")),
     check_fn=check_todo_requirements,
     emoji="📋",
+    side_effects={'class': 'manage_session_todo', 'risk': 'session_state_write', 'scope': ['session_state']},
+    artifact_outputs=[{'kind': 'todo_list', 'lifetime': 'tool_result'}],
 )

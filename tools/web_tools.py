@@ -1554,6 +1554,8 @@ registry.register(
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
+    side_effects={'class': 'external_web_read', 'may_access_network': True, 'risk': 'external_api_call', 'scope': ['web_search_provider']},
+    artifact_outputs=[{'kind': 'web_results', 'lifetime': 'tool_result'}],
 )
 registry.register(
     name="web_extract",
@@ -1566,4 +1568,6 @@ registry.register(
     is_async=True,
     emoji="📄",
     max_result_size_chars=100_000,
+    side_effects={'class': 'external_web_read', 'may_access_network': True, 'risk': 'external_api_call', 'scope': ['target_url']},
+    artifact_outputs=[{'kind': 'web_content', 'lifetime': 'tool_result'}],
 )

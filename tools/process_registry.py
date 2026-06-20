@@ -2325,4 +2325,12 @@ registry.register(
     schema=PROCESS_SCHEMA,
     handler=_handle_process,
     emoji="⚙️",
+    side_effects={
+        "class": "manage_process",
+        "scope": ["tracked_background_process"],
+        "risk": "process_control",
+        "may_send_stdin": True,
+        "may_terminate_process": True,
+    },
+    artifact_outputs=[{"kind": "process_log", "lifetime": "session"}],
 )

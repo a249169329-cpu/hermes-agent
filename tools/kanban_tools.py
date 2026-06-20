@@ -1356,6 +1356,8 @@ registry.register(
     handler=_handle_show,
     check_fn=_check_kanban_mode,
     emoji="📋",
+    side_effects={'class': 'read_kanban', 'risk': 'read_only', 'scope': ['kanban_board']},
+    artifact_outputs=[{'kind': 'kanban_task', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -1365,6 +1367,8 @@ registry.register(
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
+    side_effects={'class': 'read_kanban', 'risk': 'read_only', 'scope': ['kanban_board']},
+    artifact_outputs=[{'kind': 'kanban_task_list', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -1374,6 +1378,8 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+    side_effects={'class': 'write_kanban', 'may_modify_remote_state': True, 'risk': 'workflow_state_change', 'scope': ['kanban_board']},
+    artifact_outputs=[{'kind': 'kanban_update', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -1383,6 +1389,8 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+    side_effects={'class': 'write_kanban', 'may_modify_remote_state': True, 'risk': 'workflow_state_change', 'scope': ['kanban_board']},
+    artifact_outputs=[{'kind': 'kanban_update', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -1392,6 +1400,8 @@ registry.register(
     handler=_handle_heartbeat,
     check_fn=_check_kanban_mode,
     emoji="💓",
+    side_effects={'class': 'write_kanban', 'may_modify_remote_state': True, 'risk': 'workflow_state_change', 'scope': ['kanban_board']},
+    artifact_outputs=[{'kind': 'kanban_update', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -1401,6 +1411,8 @@ registry.register(
     handler=_handle_comment,
     check_fn=_check_kanban_mode,
     emoji="💬",
+    side_effects={'class': 'write_kanban', 'may_modify_remote_state': True, 'risk': 'workflow_state_change', 'scope': ['kanban_board']},
+    artifact_outputs=[{'kind': 'kanban_comment', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -1410,6 +1422,8 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+    side_effects={'class': 'write_kanban', 'may_modify_remote_state': True, 'risk': 'workflow_state_change', 'scope': ['kanban_board']},
+    artifact_outputs=[{'kind': 'kanban_task', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -1419,6 +1433,8 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+    side_effects={'class': 'write_kanban', 'may_modify_remote_state': True, 'risk': 'workflow_state_change', 'scope': ['kanban_board']},
+    artifact_outputs=[{'kind': 'kanban_update', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -1428,4 +1444,6 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+    side_effects={'class': 'write_kanban', 'may_modify_remote_state': True, 'risk': 'workflow_state_change', 'scope': ['kanban_board']},
+    artifact_outputs=[{'kind': 'kanban_link', 'lifetime': 'tool_result'}],
 )

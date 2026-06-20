@@ -29,6 +29,8 @@ registry.register(
         "etc.). Background computer-use: does NOT steal the user's cursor "
         "or keyboard focus."
     ),
+    side_effects={'class': 'computer_control', 'may_control_ui': True, 'risk': 'computer_interaction', 'scope': ['computer_session']},
+    artifact_outputs=[{'kind': 'computer_action_result', 'lifetime': 'tool_result'}],
 )
 
 

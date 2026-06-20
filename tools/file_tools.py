@@ -1580,7 +1580,68 @@ def _handle_search_files(args, **kw):
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
 
-registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
-registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
-registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
-registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+registry.register(
+    name="read_file",
+    toolset="file",
+    schema=READ_FILE_SCHEMA,
+    handler=_handle_read_file,
+    check_fn=_check_file_reqs,
+    emoji="📖",
+    max_result_size_chars=100_000,
+    side_effects={
+        "class": "read_filesystem",
+        "scope": ["local_or_backend_filesystem"],
+        "risk": "read_only",
+    },
+    artifact_outputs=[{'kind': 'file_content', 'lifetime': 'tool_result'}],
+)
+registry.register(
+    name="write_file",
+    toolset="file",
+    schema=WRITE_FILE_SCHEMA,
+    handler=_handle_write_file,
+    check_fn=_check_file_reqs,
+    emoji="✍️",
+    max_result_size_chars=100_000,
+    side_effects={
+        "class": "write_filesystem",
+        "scope": ["local_or_backend_filesystem"],
+        "risk": "write",
+        "may_create_or_overwrite": True,
+    },
+    artifact_outputs=[{"kind": "file", "lifetime": "persistent"}],
+)
+registry.register(
+    name="patch",
+    toolset="file",
+    schema=PATCH_SCHEMA,
+    handler=_handle_patch,
+    check_fn=_check_file_reqs,
+    emoji="🔧",
+    max_result_size_chars=100_000,
+    side_effects={
+        "class": "write_filesystem",
+        "scope": ["local_or_backend_filesystem"],
+        "risk": "write",
+        "may_modify_multiple_files": True,
+    },
+    artifact_outputs=[
+        {"kind": "file", "lifetime": "persistent"},
+        {"kind": "diff", "lifetime": "tool_result"},
+    ],
+)
+registry.register(
+    name="search_files",
+    toolset="file",
+    schema=SEARCH_FILES_SCHEMA,
+    handler=_handle_search_files,
+    check_fn=_check_file_reqs,
+    emoji="🔎",
+    max_result_size_chars=100_000,
+    side_effects={
+        "class": "read_filesystem",
+        "scope": ["local_or_backend_filesystem"],
+        "risk": "read_only",
+    },
+    artifact_outputs=[{'kind': 'search_results', 'lifetime': 'tool_result'}],
+)

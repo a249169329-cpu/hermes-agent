@@ -559,4 +559,6 @@ registry.register(
     is_async=False,
     emoji="🎬",
     dynamic_schema_overrides=_build_dynamic_video_schema,
+    side_effects={'class': 'generate_media', 'may_access_network': True, 'may_write_files': True, 'risk': 'external_api_call', 'scope': ['external_video_provider', 'local_media_cache']},
+    artifact_outputs=[{'kind': 'video', 'lifetime': 'persistent_or_remote'}],
 )

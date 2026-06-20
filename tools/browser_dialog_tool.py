@@ -145,4 +145,6 @@ registry.register(
     ),
     check_fn=_browser_dialog_check,
     emoji="💬",
+    side_effects={'class': 'browser_interaction', 'may_submit_or_click': True, 'risk': 'web_interaction', 'scope': ['browser_session']},
+    artifact_outputs=[{'kind': 'browser_state', 'lifetime': 'tool_result'}],
 )

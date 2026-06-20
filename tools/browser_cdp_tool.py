@@ -22,6 +22,11 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
+from tools.browser_ui_contract import (
+    browser_permission_allows,
+    classify_cdp_method,
+    classify_console_expression,
+)
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -522,6 +527,39 @@ BROWSER_CDP_SCHEMA: Dict[str, Any] = {
 }
 
 
+def _handle_browser_cdp_with_permissions(args, **kw):
+    method = args.get("method", "")
+    required_tier = classify_cdp_method(method)
+    params = args.get("params")
+    if (
+        str(method).strip().lower() == "runtime.evaluate"
+        and isinstance(params, dict)
+        and isinstance(params.get("expression"), str)
+    ):
+        required_tier = max(
+            required_tier,
+            classify_console_expression(params["expression"]),
+            key=int,
+        )
+    granted_tier = kw.get("permission_tier")
+    if not browser_permission_allows(required_tier, granted_tier):
+        return tool_error(
+            "browser_cdp method requires explicit permission tier",
+            success=False,
+            error_type="browser_permission_guard",
+            required_permission=required_tier.name,
+            granted_permission=granted_tier or "cdp_read",
+        )
+    return browser_cdp(
+        method=method,
+        params=args.get("params"),
+        target_id=args.get("target_id"),
+        frame_id=args.get("frame_id"),
+        timeout=args.get("timeout", 30.0),
+        task_id=kw.get("task_id"),
+    )
+
+
 def _browser_cdp_check() -> bool:
     """Availability check for browser_cdp.
 
@@ -556,14 +594,9 @@ registry.register(
     name="browser_cdp",
     toolset="browser-cdp",
     schema=BROWSER_CDP_SCHEMA,
-    handler=lambda args, **kw: browser_cdp(
-        method=args.get("method", ""),
-        params=args.get("params"),
-        target_id=args.get("target_id"),
-        frame_id=args.get("frame_id"),
-        timeout=args.get("timeout", 30.0),
-        task_id=kw.get("task_id"),
-    ),
+    handler=_handle_browser_cdp_with_permissions,
     check_fn=_browser_cdp_check,
     emoji="🧪",
+    side_effects={'class': 'browser_cdp', 'may_execute_cdp': True, 'risk': 'browser_escape_hatch', 'scope': ['browser_session']},
+    artifact_outputs=[{'kind': 'browser_state', 'lifetime': 'tool_result'}, {'kind': 'cdp_result', 'lifetime': 'tool_result'}],
 )

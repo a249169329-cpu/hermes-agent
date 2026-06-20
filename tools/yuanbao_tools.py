@@ -523,6 +523,8 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="👥",
+    side_effects={'class': 'yuanbao_read', 'may_access_network': True, 'risk': 'external_api_call', 'scope': ['yuanbao']},
+    artifact_outputs=[{'kind': 'yuanbao_result', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -575,6 +577,8 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="📋",
+    side_effects={'class': 'yuanbao_read', 'may_access_network': True, 'risk': 'external_api_call', 'scope': ['yuanbao']},
+    artifact_outputs=[{'kind': 'yuanbao_result', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -648,6 +652,8 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="✉️",
+    side_effects={'class': 'yuanbao_message_send', 'may_access_network': True, 'may_send_messages': True, 'risk': 'external_api_call', 'scope': ['yuanbao']},
+    artifact_outputs=[{'kind': 'message_delivery', 'lifetime': 'tool_result'}],
 )
 
 
@@ -685,6 +691,8 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="🔍",
+    side_effects={'class': 'yuanbao_read', 'may_access_network': True, 'risk': 'external_api_call', 'scope': ['yuanbao']},
+    artifact_outputs=[{'kind': 'sticker_search_results', 'lifetime': 'tool_result'}],
 )
 
 
@@ -734,4 +742,6 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="🎨",
+    side_effects={'class': 'yuanbao_message_send', 'may_access_network': True, 'may_send_messages': True, 'risk': 'external_api_call', 'scope': ['yuanbao']},
+    artifact_outputs=[{'kind': 'sticker_delivery', 'lifetime': 'tool_result'}],
 )

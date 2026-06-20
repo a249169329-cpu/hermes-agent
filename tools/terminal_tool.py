@@ -3261,4 +3261,16 @@ registry.register(
     check_fn=check_terminal_requirements,
     emoji="💻",
     max_result_size_chars=100_000,
+    side_effects={
+        "class": "execute_shell",
+        "scope": ["local_or_backend_environment"],
+        "risk": "command_execution",
+        "may_write_files": True,
+        "may_start_background_process": True,
+        "may_access_network": True,
+    },
+    artifact_outputs=[
+        {"kind": "command_output", "lifetime": "tool_result"},
+        {"kind": "background_process", "lifetime": "session"},
+    ],
 )

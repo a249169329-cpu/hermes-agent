@@ -392,6 +392,8 @@ registry.register(
     is_async=False,
     description="List document comments",
     emoji="\U0001f4ac",
+    side_effects={'class': 'read_external_service', 'may_access_network': True, 'risk': 'read_only', 'scope': ['feishu_drive']},
+    artifact_outputs=[{'kind': 'comment_list', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -404,6 +406,8 @@ registry.register(
     is_async=False,
     description="List comment replies",
     emoji="\U0001f4ac",
+    side_effects={'class': 'read_external_service', 'may_access_network': True, 'risk': 'read_only', 'scope': ['feishu_drive']},
+    artifact_outputs=[{'kind': 'comment_list', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -416,6 +420,8 @@ registry.register(
     is_async=False,
     description="Reply to a document comment",
     emoji="\u2709\ufe0f",
+    side_effects={'class': 'write_external_service', 'may_access_network': True, 'may_modify_remote_state': True, 'risk': 'external_api_call', 'scope': ['feishu_drive']},
+    artifact_outputs=[{'kind': 'comment', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -428,4 +434,6 @@ registry.register(
     is_async=False,
     description="Add a whole-document comment",
     emoji="\u2709\ufe0f",
+    side_effects={'class': 'write_external_service', 'may_access_network': True, 'may_modify_remote_state': True, 'risk': 'external_api_call', 'scope': ['feishu_drive']},
+    artifact_outputs=[{'kind': 'comment', 'lifetime': 'tool_result'}],
 )

@@ -483,6 +483,8 @@ registry.register(
     handler=_handle_list_entities,
     check_fn=_check_ha_available,
     emoji="🏠",
+    side_effects={'class': 'smart_home_read', 'may_access_network': True, 'risk': 'read_only', 'scope': ['homeassistant']},
+    artifact_outputs=[{'kind': 'entity_list', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -492,6 +494,8 @@ registry.register(
     handler=_handle_get_state,
     check_fn=_check_ha_available,
     emoji="🏠",
+    side_effects={'class': 'smart_home_read', 'may_access_network': True, 'risk': 'read_only', 'scope': ['homeassistant']},
+    artifact_outputs=[{'kind': 'entity_state', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -501,6 +505,8 @@ registry.register(
     handler=_handle_list_services,
     check_fn=_check_ha_available,
     emoji="🏠",
+    side_effects={'class': 'smart_home_read', 'may_access_network': True, 'risk': 'read_only', 'scope': ['homeassistant']},
+    artifact_outputs=[{'kind': 'service_list', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -510,4 +516,6 @@ registry.register(
     handler=_handle_call_service,
     check_fn=_check_ha_available,
     emoji="🏠",
+    side_effects={'class': 'smart_home_control', 'may_access_network': True, 'may_modify_remote_state': True, 'risk': 'physical_world_action', 'scope': ['homeassistant']},
+    artifact_outputs=[{'kind': 'service_call_result', 'lifetime': 'tool_result'}],
 )

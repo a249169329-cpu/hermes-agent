@@ -804,6 +804,8 @@ registry.register(
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",
+    side_effects={'class': 'manage_memory', 'may_write_files': True, 'risk': 'persistent_context_write', 'scope': ['persistent_memory']},
+    artifact_outputs=[{'kind': 'memory_update', 'lifetime': 'tool_result'}],
 )
 
 

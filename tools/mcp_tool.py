@@ -3554,6 +3554,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
+            side_effects={'class': 'external_mcp_tool', 'may_access_network': True, 'may_modify_remote_state': True, 'risk': 'delegated_external_tool', 'scope': ['mcp_server']},
+            artifact_outputs=[{'kind': 'mcp_result', 'lifetime': 'tool_result'}],
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)
@@ -3591,6 +3593,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            side_effects={'class': 'mcp_utility', 'may_access_network': True, 'risk': 'external_api_call', 'scope': ['mcp_server']},
+            artifact_outputs=[{'kind': 'mcp_resource', 'lifetime': 'tool_result'}],
         )
         _track_mcp_tool_server(util_name, name)
         registered_names.append(util_name)

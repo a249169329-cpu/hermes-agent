@@ -138,4 +138,6 @@ registry.register(
         callback=kw.get("callback")),
     check_fn=check_clarify_requirements,
     emoji="❓",
+    side_effects={'class': 'request_user_input', 'risk': 'user_interaction', 'scope': ['user_chat']},
+    artifact_outputs=[{'kind': 'user_response', 'lifetime': 'tool_result'}],
 )

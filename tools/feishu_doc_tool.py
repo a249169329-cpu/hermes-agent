@@ -135,4 +135,6 @@ registry.register(
     is_async=False,
     description="Read Feishu document content",
     emoji="\U0001f4c4",
+    side_effects={'class': 'read_external_service', 'may_access_network': True, 'risk': 'read_only', 'scope': ['feishu_doc']},
+    artifact_outputs=[{'kind': 'document_content', 'lifetime': 'tool_result'}],
 )

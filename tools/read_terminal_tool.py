@@ -90,4 +90,6 @@ registry.register(
     ),
     check_fn=check_read_terminal_requirements,
     emoji="🖥️",
+    side_effects={'class': 'read_terminal_output', 'risk': 'read_only', 'scope': ['terminal_session']},
+    artifact_outputs=[{'kind': 'terminal_output', 'lifetime': 'tool_result'}],
 )

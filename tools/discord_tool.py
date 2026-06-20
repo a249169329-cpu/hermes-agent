@@ -947,6 +947,8 @@ registry.register(
     handler=_make_handler(discord_core),
     check_fn=check_discord_tool_requirements,
     requires_env=["DISCORD_BOT_TOKEN"],
+    side_effects={'class': 'external_messaging', 'may_access_network': True, 'may_send_messages': True, 'risk': 'external_api_call', 'scope': ['discord']},
+    artifact_outputs=[{'kind': 'discord_result', 'lifetime': 'tool_result'}],
 )
 
 registry.register(
@@ -956,4 +958,6 @@ registry.register(
     handler=_make_handler(discord_admin_handler),
     check_fn=check_discord_tool_requirements,
     requires_env=["DISCORD_BOT_TOKEN"],
+    side_effects={'class': 'external_admin_action', 'may_access_network': True, 'may_modify_remote_state': True, 'risk': 'moderation_action', 'scope': ['discord']},
+    artifact_outputs=[{'kind': 'discord_result', 'lifetime': 'tool_result'}],
 )

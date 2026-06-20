@@ -1576,6 +1576,8 @@ registry.register(
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
+    side_effects={'class': 'read_skills', 'risk': 'read_only', 'scope': ['skills_directory']},
+    artifact_outputs=[{'kind': 'skill_list', 'lifetime': 'tool_result'}],
 )
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
@@ -1609,4 +1611,6 @@ registry.register(
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
     emoji="📚",
+    side_effects={'class': 'read_skills', 'risk': 'read_only', 'scope': ['skills_directory']},
+    artifact_outputs=[{'kind': 'skill_content', 'lifetime': 'tool_result'}],
 )
