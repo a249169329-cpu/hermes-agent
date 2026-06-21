@@ -530,7 +530,10 @@ class TestWebSearchSchema:
              patch.object(tools.web_tools._debug, "save"):
             result = json.loads(tools.web_tools.web_search_tool("docs", limit=500))
 
-        assert result == {"success": True, "data": {"web": []}}
+        assert result["tool_name"] == "web_search"
+        assert result["tool_class"] == "web"
+        assert result["success"] is True
+        assert result["data"] == {"web": []}
         fake_search.assert_called_once_with("docs", 100)
 
 
@@ -558,7 +561,10 @@ class TestWebSearchErrorHandling:
              patch.object(tools.web_tools._debug, "save"):
             result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
 
-        assert result == {"error": "Error searching web: boom"}
+        assert result["tool_name"] == "web_search"
+        assert result["tool_class"] == "web"
+        assert result["success"] is False
+        assert result["error"] == "Error searching web: boom"
 
         debug_payload = mock_log_call.call_args.args[1]
         assert debug_payload["error"] == "Error searching web: boom"

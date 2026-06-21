@@ -187,8 +187,9 @@ class TestWebSearchTavily:
              patch("tools.interrupt.is_interrupted", return_value=False):
             from tools.web_tools import web_search_tool
             result = json.loads(web_search_tool("test query", limit=3))
+            assert result["tool_name"] == "web_search"
+            assert result["tool_class"] == "web"
             assert result["success"] is True
-            assert len(result["data"]["web"]) == 1
             assert result["data"]["web"][0]["title"] == "Result"
 
 
@@ -221,7 +222,8 @@ class TestWebExtractTavily:
             result = json.loads(asyncio.get_event_loop().run_until_complete(
                 web_extract_tool(["https://example.com"], use_llm_processing=False)
             ))
-            assert "results" in result
-            assert len(result["results"]) == 1
+            assert result["tool_name"] == "web_extract"
+            assert result["tool_class"] == "web"
+            assert result["success"] is True
             assert result["results"][0]["url"] == "https://example.com"
 

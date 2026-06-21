@@ -822,6 +822,91 @@ def _tool_result_observer_fields(result: Any) -> tuple[str, Optional[str], Optio
     return "ok", None, None
 
 
+_TOOL_OUTPUT_PACKET_CLASSES = {"web", "mcp"}
+
+
+def _parse_jsonish_tool_result(result: Any) -> Any:
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except (TypeError, ValueError):
+            return {"text": result}
+    return result
+
+
+def _tool_output_success(parsed_result: Any) -> bool:
+    if isinstance(parsed_result, dict):
+        if parsed_result.get("error"):
+            return False
+        status = str(parsed_result.get("status") or "").lower()
+        if status.startswith("rejected") or status in {"error", "failed", "cancelled"}:
+            return False
+        if parsed_result.get("success") is False:
+            return False
+    return True
+
+
+def _tool_output_summary(tool_name: str, tool_class: str, parsed_result: Any) -> str:
+    if isinstance(parsed_result, dict) and parsed_result.get("error"):
+        return f"{tool_name} returned an error"
+    if tool_class == "web" and isinstance(parsed_result, dict):
+        data = parsed_result.get("data")
+        web_items = data.get("web") if isinstance(data, dict) else None
+        if isinstance(web_items, list):
+            return f"{tool_name} returned {len(web_items)} web result(s)"
+    if tool_class == "mcp":
+        return f"{tool_name} returned MCP tool output"
+    return f"{tool_name} returned {tool_class} tool output"
+
+
+def _wrap_tool_result_for_model_context(function_name: str, result: Any) -> Any:
+    """Return a low-risk ToolOutputPacket envelope for model-visible output.
+
+    This is intentionally narrow: only web/search and MCP-style tools are
+    wrapped in this slice. High-risk artifact-producing or mutating tools keep
+    their existing return paths until their class adapters have dedicated live
+    integration tests.
+    """
+    entry = registry.get_entry(function_name)
+    if entry is None:
+        return result
+    try:
+        from tools.tool_class_adapter import resolve_tool_class_adapter
+        from tools.tool_input_packet import PacketLimits
+        from tools.tool_output_guard import sanitize_tool_result_for_model
+        from tools.tool_output_packet import ToolOutputPacket, validate_tool_output_packet
+    except Exception:
+        return result
+
+    adapter = resolve_tool_class_adapter(entry)
+    if adapter.tool_class not in _TOOL_OUTPUT_PACKET_CLASSES:
+        return result
+
+    sanitized_result = sanitize_tool_result_for_model(function_name, result)
+    parsed_result = _parse_jsonish_tool_result(sanitized_result)
+    if isinstance(parsed_result, dict) and parsed_result.get("tool_name") and parsed_result.get("tool_class") and parsed_result.get("summary") and "bounded_payload" in parsed_result:
+        return sanitized_result
+    bounded_payload = parsed_result if isinstance(parsed_result, dict) else {"value": parsed_result}
+    packet = ToolOutputPacket(
+        tool_name=function_name,
+        tool_class=adapter.tool_class,
+        success=_tool_output_success(parsed_result),
+        summary=_tool_output_summary(function_name, adapter.tool_class, parsed_result),
+        bounded_payload=bounded_payload,
+    )
+    output_limits = PacketLimits(max_chars=adapter.output_policy.max_chars, max_lines=120)
+    violations = validate_tool_output_packet(packet, limits=output_limits)
+    if violations:
+        packet = ToolOutputPacket(
+            tool_name=function_name,
+            tool_class=adapter.tool_class,
+            success=_tool_output_success(parsed_result),
+            summary=_tool_output_summary(function_name, adapter.tool_class, parsed_result),
+            warnings=[f"bounded_payload_omitted:{','.join(violations)}"],
+        )
+    return adapter.render_output(packet)
+
+
 def _emit_post_tool_call_hook(
     *,
     function_name: str,
@@ -1260,6 +1345,20 @@ def handle_function_call(
                         break
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
+
+        try:
+            result = _wrap_tool_result_for_model_context(function_name, result)
+        except Exception as _output_packet_err:
+            logger.exception("tool output packet adapter failed for %s: %s", function_name, _output_packet_err)
+            result = json.dumps(
+                {
+                    "error": "Tool output packet adapter failed before returning result",
+                    "status": "rejected_tool_output",
+                    "reason": "tool_output_packet_adapter_failed",
+                    "tool_name": function_name,
+                },
+                ensure_ascii=False,
+            )
 
         try:
             from tools.tool_output_guard import sanitize_tool_result_for_model

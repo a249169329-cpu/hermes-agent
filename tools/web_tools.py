@@ -103,6 +103,7 @@ from tools.tool_backend_helpers import (  # noqa: F401
     prefers_gateway,
 )
 from tools.url_safety import async_is_safe_url, normalize_url_for_request
+from tools.tool_output_packet import ToolOutputPacket, render_tool_output_packet_for_model
 import sys
 
 logger = logging.getLogger(__name__)
@@ -280,6 +281,45 @@ def _is_backend_available(backend: str) -> bool:
         except Exception:
             return False
     return False
+
+
+def _wrap_web_output_packet(tool_name: str, result_json: str) -> str:
+    """Return a bounded ToolOutputPacket for web tools.
+
+    Kept narrow: only the web entrypoints in this module use it.
+    """
+    try:
+        parsed = json.loads(result_json)
+    except (TypeError, ValueError):
+        parsed = {"value": result_json}
+
+    if isinstance(parsed, dict) and parsed.get("error"):
+        summary = f"{tool_name} returned an error"
+        success = False
+    elif isinstance(parsed, dict) and parsed.get("success") is False:
+        summary = f"{tool_name} returned an error"
+        success = False
+    elif tool_name == "web_search" and isinstance(parsed, dict):
+        web_items = ((parsed.get("data") or {}).get("web") if isinstance(parsed.get("data"), dict) else None)
+        count = len(web_items) if isinstance(web_items, list) else 0
+        summary = f"{tool_name} returned {count} web result(s)"
+        success = True
+    elif tool_name == "web_extract" and isinstance(parsed, dict):
+        result_count = len(parsed.get("results") or []) if isinstance(parsed.get("results"), list) else 0
+        summary = f"{tool_name} returned {result_count} extracted result(s)"
+        success = True
+    else:
+        summary = f"{tool_name} returned web tool output"
+        success = True
+
+    packet = ToolOutputPacket(
+        tool_name=tool_name,
+        tool_class="web",
+        success=success,
+        summary=summary,
+        bounded_payload=parsed if isinstance(parsed, dict) else {"value": parsed},
+    )
+    return render_tool_output_packet_for_model(packet)
 
 
 def _ddgs_package_importable() -> bool:
@@ -969,7 +1009,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     try:
         from tools.interrupt import is_interrupted
         if is_interrupted():
-            return tool_error("Interrupted", success=False)
+            return _wrap_web_output_packet("web_search", tool_error("Interrupted", success=False))
 
         # Dispatch through the web search registry. All 7 providers
         # (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl)
@@ -1009,7 +1049,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         debug_call_data["final_response_size"] = len(result_json)
         _debug.log_call("web_search_tool", debug_call_data)
         _debug.save()
-        return result_json
+        return _wrap_web_output_packet("web_search", result_json)
 
     except Exception as e:
         error_msg = f"Error searching web: {str(e)}"
@@ -1019,7 +1059,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         _debug.log_call("web_search_tool", debug_call_data)
         _debug.save()
 
-        return tool_error(error_msg)
+        return _wrap_web_output_packet("web_search", tool_error(error_msg))
 
 
 async def web_extract_tool(
@@ -1064,11 +1104,11 @@ async def web_extract_tool(
             or _PREFIX_RE.search(normalized_url)
             or _PREFIX_RE.search(unquote(normalized_url))
         ):
-            return json.dumps({
+            return _wrap_web_output_packet("web_extract", json.dumps({
                 "success": False,
                 "error": "Blocked: URL contains what appears to be an API key or token. "
                          "Secrets must not be sent in URLs.",
-            })
+            }, ensure_ascii=False))
         normalized_urls.append(normalized_url)
 
     debug_call_data = {
@@ -1139,7 +1179,7 @@ async def web_extract_tool(
                 # isn't registered at all (typo / uninstalled plugin), fall
                 # through to the active-provider walk.
                 if provider is not None and not provider.supports_extract():
-                    return json.dumps(
+                    return _wrap_web_output_packet("web_extract", json.dumps(
                         {
                             "success": False,
                             "error": (
@@ -1150,10 +1190,10 @@ async def web_extract_tool(
                             ),
                         },
                         ensure_ascii=False,
-                    )
+                    ))
                 provider = get_active_extract_provider()
                 if provider is None:
-                    return json.dumps(
+                    return _wrap_web_output_packet("web_extract", json.dumps(
                         {
                             "success": False,
                             "error": (
@@ -1163,7 +1203,7 @@ async def web_extract_tool(
                             ),
                         },
                         ensure_ascii=False,
-                    )
+                    ))
 
             logger.info(
                 "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
@@ -1315,7 +1355,7 @@ async def web_extract_tool(
         _debug.log_call("web_extract_tool", debug_call_data)
         _debug.save()
         
-        return cleaned_result
+        return _wrap_web_output_packet("web_extract", cleaned_result)
             
     except Exception as e:
         error_msg = f"Error extracting content: {str(e)}"
@@ -1325,7 +1365,7 @@ async def web_extract_tool(
         _debug.log_call("web_extract_tool", debug_call_data)
         _debug.save()
         
-        return tool_error(error_msg)
+        return _wrap_web_output_packet("web_extract", tool_error(error_msg))
 
 
 def web_tools_registered() -> bool:

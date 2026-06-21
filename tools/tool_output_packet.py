@@ -95,6 +95,13 @@ def _compact_model_payload(packet: ToolOutputPacket) -> dict[str, Any]:
         payload["output_references"] = list(packet.output_references)
     if packet.bounded_payload:
         payload["bounded_payload"] = dict(packet.bounded_payload)
+        if isinstance(packet.bounded_payload, dict):
+            if "data" in packet.bounded_payload and "data" not in payload:
+                payload["data"] = packet.bounded_payload["data"]
+            if "results" in packet.bounded_payload and "results" not in payload:
+                payload["results"] = packet.bounded_payload["results"]
+            if "error" in packet.bounded_payload and "error" not in payload:
+                payload["error"] = packet.bounded_payload["error"]
     if packet.provider_metadata_summary:
         payload["provider_metadata_summary"] = dict(packet.provider_metadata_summary)
     if packet.warnings:
