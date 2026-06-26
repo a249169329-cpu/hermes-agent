@@ -30,6 +30,7 @@ from tools.delegate_tool import (
     _build_child_system_prompt,
     _extract_output_tail,
     _strip_blocked_tools,
+    _normalize_child_observability,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
 )
@@ -647,6 +648,69 @@ class TestDelegateObservability(unittest.TestCase):
         for entry in tail:
             self.assertNotIn("'type'", entry["preview"])
 
+    def test_side_effect_ledger_summarizes_file_network_and_message_effects(self):
+        """Completed child should expose a bounded side-effect ledger for parent verification."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_file", "function": {"name": "write_file", "arguments": '{"path": "/tmp/out.txt"}'}},
+                        {"id": "tc_web", "function": {"name": "web_search", "arguments": '{"query": "hermes"}'}},
+                        {"id": "tc_msg", "function": {"name": "send_message", "arguments": '{"target": "qqbot"}'}},
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_file", "content": '{"success": true, "path": "/tmp/out.txt"}'},
+                    {"role": "tool", "tool_call_id": "tc_web", "content": '{"data": {"web": [{"url": "https://example.com"}]}}'},
+                    {"role": "tool", "tool_call_id": "tc_msg", "content": '{"success": true, "message_id": "msg-123"}'},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test side effects", parent_agent=parent))
+            ledger = result["results"][0]["side_effect_ledger"]
+
+        self.assertEqual(ledger["counts"]["file"], 1)
+        self.assertEqual(ledger["counts"]["network"], 2)
+        self.assertEqual(ledger["counts"]["message"], 1)
+        self.assertIn("/tmp/out.txt", ledger["verification_hints"]["files_to_check"])
+        self.assertIn("https://example.com", ledger["verification_hints"]["urls_to_check"])
+        self.assertIn("msg-123", ledger["verification_hints"]["message_ids_to_check"])
+        self.assertEqual([item["tool"] for item in ledger["items"]], ["write_file", "web_search", "send_message"])
+
+    def test_successful_child_diagnostic_summary_is_neutral(self):
+        """Completed child diagnostics should not imply an abnormal exit."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test completed diagnostic", parent_agent=parent))
+            diagnostic = result["results"][0]["diagnostic_summary"]
+
+        self.assertEqual(diagnostic["reason"], "completed")
+        self.assertIn("completed", diagnostic["parent_summary"])
+        self.assertNotIn("non-standard", diagnostic["parent_summary"])
+
     def test_tool_trace_detects_error(self):
         """Tool results containing 'error' should be marked as error status."""
         parent = _make_mock_parent(depth=0)
@@ -742,7 +806,58 @@ class TestDelegateObservability(unittest.TestCase):
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="Test interrupt", parent_agent=parent))
-            self.assertEqual(result["results"][0]["exit_reason"], "interrupted")
+            entry = result["results"][0]
+            self.assertEqual(entry["exit_reason"], "interrupted")
+            diagnostic = entry["diagnostic_summary"]
+            self.assertEqual(diagnostic["reason"], "interrupted")
+            self.assertIn("interrupted", diagnostic["parent_summary"])
+            self.assertEqual(diagnostic["api_calls"], 2)
+            self.assertEqual(diagnostic["diagnostic_path"], None)
+
+    def test_timeout_diagnostic_summary_explains_zero_api_hang(self):
+        """Timeout entries should carry a parent-readable diagnostic summary."""
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        child._credential_pool = None
+        child.model = "claude-sonnet-4-6"
+        child.get_activity_summary.return_value = {"api_call_count": 0}
+        child.run_conversation.side_effect = FuturesTimeoutError()
+
+        with patch("tools.delegate_tool._load_config", return_value={"child_timeout_seconds": 0.01}), \
+             patch("tools.delegate_tool._dump_subagent_timeout_diagnostic", return_value="/tmp/diag.json"):
+            result = _run_single_child(
+                task_index=3,
+                goal="hang before first call",
+                child=child,
+                parent_agent=parent,
+            )
+
+        self.assertEqual(result["status"], "timeout")
+        diagnostic = result["diagnostic_summary"]
+        self.assertEqual(diagnostic["reason"], "timeout_before_first_api_call")
+        self.assertEqual(diagnostic["diagnostic_path"], "/tmp/diag.json")
+        self.assertIn("never reached its first LLM request", diagnostic["parent_summary"])
+        self.assertIn("/tmp/diag.json", diagnostic["parent_summary"])
+
+    def test_normalize_child_observability_fills_fabricated_interrupted_entries(self):
+        """Batch fabricated interrupted entries still need parent-readable diagnostics."""
+        entry = {
+            "task_index": 1,
+            "status": "interrupted",
+            "summary": None,
+            "error": "Parent agent interrupted — child did not finish in time",
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+
+        normalized = _normalize_child_observability(entry)
+
+        self.assertEqual(normalized["side_effect_ledger"]["items"], [])
+        self.assertEqual(normalized["diagnostic_summary"]["reason"], "interrupted")
+        self.assertIn("interrupted", normalized["diagnostic_summary"]["parent_summary"])
 
     def test_exit_reason_max_iterations(self):
         """Child that didn't complete and wasn't interrupted hit max_iterations."""

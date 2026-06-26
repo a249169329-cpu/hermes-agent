@@ -354,6 +354,284 @@ def _looks_like_error_output(content: Any) -> bool:
     )
 
 
+def _parse_jsonish(text: Any) -> Any:
+    """Best-effort JSON parser for tool args/results, returning None on failure."""
+    if isinstance(text, (dict, list)):
+        return text
+    if not isinstance(text, str):
+        return None
+    raw = text.strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _walk_json_values(value: Any):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _walk_json_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_json_values(item)
+    else:
+        yield value
+
+
+def _looks_like_url(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+
+def _bounded_unique(values: list[str], limit: int = 12) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _side_effect_categories(tool_name: str, side_effects: dict[str, Any]) -> set[str]:
+    categories: set[str] = set()
+    effect_class = str(side_effects.get("class") or "").lower()
+    tool = (tool_name or "").lower()
+
+    if side_effects.get("may_write_files") or tool in {"write_file", "patch"}:
+        categories.add("file")
+    if side_effects.get("may_access_network") or effect_class.startswith("external_"):
+        categories.add("network")
+    if side_effects.get("may_send_messages") or side_effects.get("may_deliver_messages"):
+        categories.add("message")
+    if side_effects.get("may_modify_remote_state") or "write_external" in effect_class:
+        categories.add("remote_state")
+
+    # Tool-name fallbacks keep the ledger useful in tests and in partially
+    # registered/plugin-heavy sessions where governance metadata is absent.
+    if tool in {"web_search", "web_extract", "x_search", "vision_analyze", "image_generate", "video_generate", "text_to_speech"}:
+        categories.add("network")
+    if tool in {"send_message", "clarify", "cronjob"} or "message" in tool or tool.startswith("yuanbao_"):
+        categories.add("message")
+    if "kanban" in tool or tool in {"cronjob", "homeassistant", "spotify_playback", "spotify_queue", "spotify_library"}:
+        categories.add("remote_state")
+
+    return categories
+
+
+def _build_side_effect_ledger(messages: Any, *, max_items: int = 20) -> Dict[str, Any]:
+    """Summarize child tool side effects for parent verification.
+
+    This is intentionally a bounded, model-visible summary — not a raw tool
+    transcript.  It helps the parent decide what to verify (files, URLs,
+    message ids) without trusting the child summary alone.
+    """
+    counts: Dict[str, int] = {"file": 0, "network": 0, "message": 0, "remote_state": 0}
+    hints: Dict[str, list[str]] = {
+        "files_to_check": [],
+        "urls_to_check": [],
+        "message_ids_to_check": [],
+        "remote_scopes_to_check": [],
+    }
+    items: list[Dict[str, Any]] = []
+    if not isinstance(messages, list):
+        return {"counts": counts, "items": items, "verification_hints": hints}
+
+    calls_by_id: Dict[str, Dict[str, Any]] = {}
+    ordered_calls: list[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            tool_name = str(fn.get("name") or "unknown")
+            args = _parse_jsonish(fn.get("arguments") or "")
+            call = {"tool": tool_name, "args": args if isinstance(args, dict) else {}}
+            ordered_calls.append(call)
+            tc_id = tc.get("id")
+            if tc_id:
+                calls_by_id[str(tc_id)] = call
+
+    fallback_index = 0
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        tc_id = msg.get("tool_call_id")
+        call = calls_by_id.get(str(tc_id)) if tc_id else None
+        if call is None and fallback_index < len(ordered_calls):
+            call = ordered_calls[fallback_index]
+        fallback_index += 1
+        if call is None:
+            continue
+
+        tool_name = str(call.get("tool") or "unknown")
+        try:
+            from tools.registry import registry
+
+            metadata = registry.get_tool_governance_metadata(tool_name) or {}
+        except Exception:
+            metadata = {}
+        side_effects = metadata.get("side_effects") if isinstance(metadata, dict) else {}
+        if not isinstance(side_effects, dict):
+            side_effects = {}
+        categories = _side_effect_categories(tool_name, side_effects)
+        if not categories:
+            continue
+
+        content = _stringify_tool_content(msg.get("content", ""))
+        parsed = _parse_jsonish(content)
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+
+        for category in categories:
+            if category in counts:
+                counts[category] += 1
+
+        file_refs: list[str] = []
+        for key in ("path", "file", "output_path"):
+            value = args.get(key) if isinstance(args, dict) else None
+            if isinstance(value, str):
+                file_refs.append(value)
+        if isinstance(parsed, dict):
+            for key in ("path", "file", "output_path", "absolute_path"):
+                value = parsed.get(key)
+                if isinstance(value, str):
+                    file_refs.append(value)
+        if "file" in categories:
+            hints["files_to_check"].extend(file_refs)
+
+        urls: list[str] = []
+        if isinstance(args, dict):
+            for value in _walk_json_values(args):
+                if _looks_like_url(value):
+                    urls.append(value)
+        if parsed is not None:
+            for value in _walk_json_values(parsed):
+                if _looks_like_url(value):
+                    urls.append(value)
+        if "network" in categories:
+            hints["urls_to_check"].extend(urls)
+
+        message_ids: list[str] = []
+        if isinstance(parsed, dict):
+            for key in ("message_id", "id", "delivery_id"):
+                value = parsed.get(key)
+                if isinstance(value, str):
+                    message_ids.append(value)
+        if "message" in categories:
+            hints["message_ids_to_check"].extend(message_ids)
+
+        scopes = side_effects.get("scope")
+        if isinstance(scopes, list) and ("remote_state" in categories or "message" in categories):
+            hints["remote_scopes_to_check"].extend(str(s) for s in scopes if s)
+
+        item: Dict[str, Any] = {
+            "tool": tool_name,
+            "categories": sorted(categories),
+            "status": "error" if _looks_like_error_output(content) else "ok",
+        }
+        if file_refs:
+            item["files"] = _bounded_unique(file_refs, 3)
+        if urls:
+            item["urls"] = _bounded_unique(urls, 3)
+        if message_ids:
+            item["message_ids"] = _bounded_unique(message_ids, 3)
+        items.append(item)
+        if len(items) >= max_items:
+            break
+
+    hints = {key: _bounded_unique(value) for key, value in hints.items()}
+    return {"counts": counts, "items": items, "verification_hints": hints}
+
+
+def _build_diagnostic_summary(
+    *,
+    status: str,
+    exit_reason: str,
+    api_calls: int,
+    duration_seconds: float,
+    error: Optional[str] = None,
+    diagnostic_path: Optional[str] = None,
+    child_timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Return a compact parent-readable explanation for non-happy exits."""
+    if exit_reason == "timeout" and api_calls == 0:
+        reason = "timeout_before_first_api_call"
+        parent_summary = (
+            f"Subagent timed out after {child_timeout}s and never reached its first LLM request; "
+            "check prompt construction, credential resolution, or transport startup."
+        )
+    elif exit_reason == "timeout":
+        reason = "timeout_after_api_calls"
+        parent_summary = (
+            f"Subagent timed out after {child_timeout}s with {api_calls} API call(s) completed; "
+            "likely stuck on a slow API call or unresponsive network/tool request."
+        )
+    elif exit_reason == "interrupted" or status == "interrupted":
+        reason = "interrupted"
+        parent_summary = "Subagent was interrupted before producing a final summary."
+    elif status in {"failed", "error"}:
+        reason = "error"
+        parent_summary = error or "Subagent failed before producing a usable summary."
+    elif exit_reason == "max_iterations":
+        reason = "max_iterations"
+        parent_summary = "Subagent reached its iteration budget without producing a final summary."
+    elif exit_reason == "completed" or status == "completed":
+        reason = "completed"
+        parent_summary = "Subagent completed and produced a final summary."
+    else:
+        reason = exit_reason or status or "unknown"
+        parent_summary = error or "Subagent finished with a non-standard exit reason."
+
+    if diagnostic_path:
+        parent_summary += f" Diagnostic: {diagnostic_path}"
+
+    return {
+        "reason": reason,
+        "parent_summary": parent_summary,
+        "diagnostic_path": diagnostic_path,
+        "api_calls": int(api_calls) if isinstance(api_calls, (int, float)) else 0,
+        "duration_seconds": duration_seconds,
+    }
+
+
+def _normalize_child_observability(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure every child result carries ledger + diagnostic fields.
+
+    Normal _run_single_child entries include these directly.  Batch interrupt
+    and future-exception branches fabricate minimal entries, so normalize them
+    before returning to the parent/model.
+    """
+    if "side_effect_ledger" not in entry:
+        entry["side_effect_ledger"] = _build_side_effect_ledger([])
+    if "diagnostic_summary" not in entry:
+        status = str(entry.get("status") or "")
+        exit_reason = str(entry.get("exit_reason") or status or "unknown")
+        api_calls = entry.get("api_calls", 0)
+        duration_seconds = entry.get("duration_seconds", 0)
+        entry["diagnostic_summary"] = _build_diagnostic_summary(
+            status=status,
+            exit_reason=exit_reason,
+            api_calls=int(api_calls) if isinstance(api_calls, (int, float)) else 0,
+            duration_seconds=(
+                float(duration_seconds)
+                if isinstance(duration_seconds, (int, float))
+                else 0.0
+            ),
+            error=entry.get("error"),
+            diagnostic_path=entry.get("diagnostic_path"),
+            child_timeout=None,
+        )
+    return entry
+
+
 def _normalize_role(r: Optional[str]) -> str:
     """Normalise a caller-provided role to 'leaf' or 'orchestrator'.
 
@@ -1708,16 +1986,27 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            exit_reason = "timeout" if is_timeout else "error"
             return {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
                 "error": _err,
-                "exit_reason": "timeout" if is_timeout else "error",
+                "exit_reason": exit_reason,
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "diagnostic_summary": _build_diagnostic_summary(
+                    status="timeout" if is_timeout else "error",
+                    exit_reason=exit_reason,
+                    api_calls=child_api_calls,
+                    duration_seconds=duration,
+                    error=_err,
+                    diagnostic_path=diagnostic_path,
+                    child_timeout=child_timeout,
+                ),
+                "side_effect_ledger": _build_side_effect_ledger([]),
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -1814,6 +2103,16 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
+            "side_effect_ledger": _build_side_effect_ledger(messages),
+            "diagnostic_summary": _build_diagnostic_summary(
+                status=status,
+                exit_reason=exit_reason,
+                api_calls=api_calls,
+                duration_seconds=duration,
+                error=result.get("error"),
+                diagnostic_path=None,
+                child_timeout=None,
+            ),
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
@@ -1916,6 +2215,8 @@ def _run_single_child(
             "files_read": _files_read,
             "files_written": _files_written,
             "output_tail": _output_tail,
+            "side_effect_ledger": entry.get("side_effect_ledger", {}),
+            "diagnostic_summary": entry.get("diagnostic_summary", {}),
         }
         if _cost_usd is not None:
             try:
@@ -2353,6 +2654,8 @@ def delegate_task(
 
         # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])
+
+    results = [_normalize_child_observability(entry) for entry in results]
 
     # Notify parent's memory provider of delegation outcomes
     if (
