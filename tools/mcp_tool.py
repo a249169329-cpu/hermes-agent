@@ -3508,16 +3508,39 @@ def _mcp_annotation_bool(mcp_tool: Any, name: str) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-def _mcp_tool_side_effects(mcp_tool: Any) -> dict[str, Any]:
+_CODEGRAPH_READ_ONLY_TOOL_NAMES = {
+    "codegraph_callees",
+    "codegraph_callers",
+    "codegraph_context",
+    "codegraph_explore",
+    "codegraph_files",
+    "codegraph_impact",
+    "codegraph_node",
+    "codegraph_search",
+    "codegraph_status",
+}
+
+
+def _mcp_inferred_read_only(mcp_tool: Any, *, server_name: str = "") -> bool:
+    """Return True for narrowly-known query-only MCP tools missing annotations."""
+    server = sanitize_mcp_name_component(str(server_name or "")).lower()
+    tool_name = sanitize_mcp_name_component(str(getattr(mcp_tool, "name", "") or "")).lower()
+    return server == "codegraph" and tool_name in _CODEGRAPH_READ_ONLY_TOOL_NAMES
+
+
+def _mcp_tool_side_effects(mcp_tool: Any, *, server_name: str = "") -> dict[str, Any]:
     """Build governance metadata for a discovered MCP tool.
 
     Unknown MCP tools fail closed because they delegate to arbitrary external
     servers.  Tools explicitly marked read-only by MCP annotations still carry
     network/delegation metadata, but do not require runtime side-effect auth.
+    A tiny allowlist covers known CodeGraph query tools from MCP SDKs that do
+    not expose ``readOnlyHint`` yet; unknown/non-query MCP tools stay closed.
     """
     read_only = _mcp_annotation_bool(mcp_tool, "readOnlyHint")
     destructive = _mcp_annotation_bool(mcp_tool, "destructiveHint")
-    may_modify = not (read_only is True and destructive is not True)
+    read_only_inferred = _mcp_inferred_read_only(mcp_tool, server_name=server_name)
+    may_modify = not ((read_only is True or read_only_inferred) and destructive is not True)
     return {
         "class": "external_mcp_tool",
         "may_access_network": True,
@@ -3529,6 +3552,7 @@ def _mcp_tool_side_effects(mcp_tool: Any) -> dict[str, Any]:
             "destructiveHint": destructive,
             "openWorldHint": _mcp_annotation_bool(mcp_tool, "openWorldHint"),
             "idempotentHint": _mcp_annotation_bool(mcp_tool, "idempotentHint"),
+            "read_only_inferred": read_only_inferred,
         },
     }
 
@@ -3596,7 +3620,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
-            side_effects=_mcp_tool_side_effects(mcp_tool),
+            side_effects=_mcp_tool_side_effects(mcp_tool, server_name=name),
             artifact_outputs=[{'kind': 'mcp_result', 'lifetime': 'tool_result'}],
         )
         _track_mcp_tool_server(tool_name_prefixed, name)

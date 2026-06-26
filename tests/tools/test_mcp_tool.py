@@ -3836,6 +3836,43 @@ class TestMCPSideEffectMetadata:
 
         _servers.pop("docs", None)
 
+    def test_mcp_codegraph_context_is_inferred_read_only_without_annotations(self):
+        """Known CodeGraph query tools should not be blocked as mutating MCP calls."""
+        from tools.registry import ToolRegistry
+        from tools.mcp_tool import _discover_and_register_server, _servers, MCPServerTask
+        from tools.side_effect_policy import requires_runtime_authorization
+
+        mock_registry = ToolRegistry()
+        context_tool = _make_mcp_tool(
+            "codegraph_context",
+            "Compose search, callers, callees, and source context for a code task.",
+        )
+        mock_session = MagicMock()
+
+        async def fake_connect(name, config):
+            server = MCPServerTask(name)
+            server.session = mock_session
+            server._tools = [context_tool]
+            return server
+
+        with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.registry.registry", mock_registry), \
+             patch("tools.side_effect_policy.registry", mock_registry):
+            registered = asyncio.run(
+                _discover_and_register_server("codegraph", {"command": "test", "args": []})
+            )
+
+            assert "mcp_codegraph_codegraph_context" in registered
+            entry = mock_registry.get_entry("mcp_codegraph_codegraph_context")
+            assert entry.side_effects["class"] == "external_mcp_tool"
+            assert entry.side_effects["may_modify_remote_state"] is False
+            assert entry.side_effects["risk"] == "external_api_call"
+            assert entry.side_effects["mcp_annotations"]["readOnlyHint"] is None
+            assert entry.side_effects["mcp_annotations"]["read_only_inferred"] is True
+            assert requires_runtime_authorization("mcp_codegraph_codegraph_context", {}) is False
+
+        _servers.pop("codegraph", None)
+
 
 # ---------------------------------------------------------------------------
 # sanitize_mcp_name_component
