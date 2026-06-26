@@ -248,6 +248,35 @@ class TestHandleFunctionCall:
         assert role_close not in rendered
         assert secret_value not in rendered
 
+    def test_prewrapped_web_tool_output_packet_is_still_size_bounded(self, monkeypatch):
+        huge_blob = "x" * 20_000
+        prewrapped = json.dumps(
+            {
+                "success": True,
+                "tool_name": "web_search",
+                "tool_class": "web",
+                "summary": "prewrapped web output",
+                "bounded_payload": {"blob": huge_blob},
+            }
+        )
+        monkeypatch.setattr("model_tools.registry.dispatch", lambda *a, **kw: prewrapped)
+
+        result = json.loads(
+            handle_function_call(
+                "web_search",
+                {"query": "cats"},
+                task_id="task-1",
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+            )
+        )
+
+        assert result["tool_name"] == "web_search"
+        assert result["tool_class"] == "web"
+        assert "bounded_payload" not in result
+        assert result["warnings"] == ["bounded_payload_omitted:tool_output_packet_too_large"]
+        assert huge_blob not in json.dumps(result)
+
     def test_mcp_tool_result_returns_output_packet_from_real_dispatch_exit(self):
         from tools.registry import registry
 

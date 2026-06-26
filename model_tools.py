@@ -884,8 +884,34 @@ def _wrap_tool_result_for_model_context(function_name: str, result: Any) -> Any:
 
     sanitized_result = sanitize_tool_result_for_model(function_name, result)
     parsed_result = _parse_jsonish_tool_result(sanitized_result)
+    output_limits = PacketLimits(max_chars=adapter.output_policy.max_chars, max_lines=120)
     if isinstance(parsed_result, dict) and parsed_result.get("tool_name") and parsed_result.get("tool_class") and parsed_result.get("summary") and "bounded_payload" in parsed_result:
-        return sanitized_result
+        success_value = parsed_result.get("success")
+        packet = ToolOutputPacket(
+            tool_name=str(parsed_result.get("tool_name") or function_name),
+            tool_class=str(parsed_result.get("tool_class") or adapter.tool_class),
+            success=success_value if isinstance(success_value, bool) else _tool_output_success(parsed_result),
+            summary=str(parsed_result.get("summary") or _tool_output_summary(function_name, adapter.tool_class, parsed_result)),
+            artifact_ids=[str(item) for item in parsed_result.get("artifact_ids") or []],
+            output_references=[str(item) for item in parsed_result.get("output_references") or []],
+            bounded_payload=parsed_result.get("bounded_payload") if isinstance(parsed_result.get("bounded_payload"), dict) else {},
+            provider_metadata_summary=parsed_result.get("provider_metadata_summary") if isinstance(parsed_result.get("provider_metadata_summary"), dict) else {},
+            warnings=[str(item) for item in parsed_result.get("warnings") or []],
+        )
+        violations = validate_tool_output_packet(packet, limits=output_limits)
+        if violations:
+            packet = ToolOutputPacket(
+                tool_name=function_name,
+                tool_class=adapter.tool_class,
+                success=packet.success,
+                summary=packet.summary,
+                artifact_ids=packet.artifact_ids,
+                output_references=packet.output_references,
+                provider_metadata_summary=packet.provider_metadata_summary,
+                warnings=[*packet.warnings, f"bounded_payload_omitted:{','.join(violations)}"],
+            )
+        return adapter.render_output(packet)
+
     bounded_payload = parsed_result if isinstance(parsed_result, dict) else {"value": parsed_result}
     packet = ToolOutputPacket(
         tool_name=function_name,
@@ -894,7 +920,6 @@ def _wrap_tool_result_for_model_context(function_name: str, result: Any) -> Any:
         summary=_tool_output_summary(function_name, adapter.tool_class, parsed_result),
         bounded_payload=bounded_payload,
     )
-    output_limits = PacketLimits(max_chars=adapter.output_policy.max_chars, max_lines=120)
     violations = validate_tool_output_packet(packet, limits=output_limits)
     if violations:
         packet = ToolOutputPacket(
