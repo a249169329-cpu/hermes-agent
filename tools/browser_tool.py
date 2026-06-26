@@ -1610,7 +1610,7 @@ BROWSER_TOOL_SCHEMAS = [
                 },
                 "expression": {
                     "type": "string",
-                    "description": "JavaScript expression to evaluate in the page context. Runs in the browser like DevTools console — full access to DOM, window, document. Return values are serialized to JSON. Example: 'document.title' or 'document.querySelectorAll(\"a\").length'"
+                    "description": "JavaScript expression to evaluate in the page context. Defaults to read-only inspection (for example 'document.title' or 'document.querySelectorAll(\"a\").length'). Expressions that mutate DOM/state, read cookie/storage, navigate, submit forms, fetch/POST, or otherwise affect the page require an explicit runtime permission tier and may be rejected by the browser permission guard. Return values are serialized to JSON."
                 }
             },
             "required": []

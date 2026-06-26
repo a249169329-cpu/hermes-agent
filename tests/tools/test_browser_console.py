@@ -116,6 +116,17 @@ class TestBrowserConsoleSchema:
         assert "clear" in props
         assert props["clear"]["type"] == "boolean"
 
+    def test_expression_schema_mentions_permission_boundaries(self):
+        from tools.browser_tool import BROWSER_TOOL_SCHEMAS
+
+        schema = next(s for s in BROWSER_TOOL_SCHEMAS if s["name"] == "browser_console")
+        desc = schema["parameters"]["properties"]["expression"]["description"]
+
+        assert "read-only" in desc
+        assert "permission" in desc
+        assert "cookie" in desc
+        assert "POST" in desc
+
 
 class TestBrowserConsoleToolsetWiring:
     """browser_console must be reachable via toolset resolution."""
