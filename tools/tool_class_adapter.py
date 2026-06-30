@@ -168,7 +168,13 @@ def infer_tool_class(entry: ToolEntry) -> str:
         return "codex"
     if name.startswith("open_design") or "open_design" in name or toolset in {"open_design", "od"}:
         return "od"
-    if toolset in {"image_gen", "image"} or "image" in artifacts or effect_class == "generate_media":
+    if (
+        toolset in {"image_gen", "image", "vision"}
+        or name in {"vision_analyze"}
+        or "image" in artifacts
+        or "vision_analysis" in artifacts
+        or effect_class == "generate_media"
+    ):
         return "image"
     if toolset == "video" or "video" in artifacts or name.startswith("video_"):
         return "video"

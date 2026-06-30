@@ -822,11 +822,12 @@ def _tool_result_observer_fields(result: Any) -> tuple[str, Optional[str], Optio
     return "ok", None, None
 
 
-_TOOL_OUTPUT_PACKET_CLASSES = {"web", "mcp", "browser"}
+_TOOL_OUTPUT_PACKET_CLASSES = {"web", "mcp", "browser", "image", "tts"}
 
 _BROWSER_CONSOLE_TEXT_LIMIT = 512
 _BROWSER_OUTPUT_ITEM_LIMIT = 50
 _BROWSER_OUTPUT_REFERENCE_LIMIT = 20
+_MEDIA_ANALYSIS_PREVIEW_LIMIT = 2048
 
 
 def _parse_jsonish_tool_result(result: Any) -> Any:
@@ -873,6 +874,10 @@ def _tool_output_summary(tool_name: str, tool_class: str, parsed_result: Any) ->
             )
         if tool_name == "browser_get_images":
             return f"browser_get_images returned {_bounded_int(parsed_result.get('count'))} image reference(s)"
+    if tool_class == "image" and tool_name == "vision_analyze":
+        return "vision_analyze returned image analysis"
+    if tool_class == "tts" and tool_name == "text_to_speech":
+        return "text_to_speech produced audio artifact"
     if tool_class == "mcp":
         return f"{tool_name} returned MCP tool output"
     return f"{tool_name} returned {tool_class} tool output"
@@ -923,7 +928,7 @@ def _bounded_browser_console_payload(parsed_result: dict[str, Any]) -> dict[str,
     return payload
 
 
-def _safe_browser_output_reference(value: Any) -> str | None:
+def _safe_tool_output_reference(value: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     try:
@@ -943,7 +948,7 @@ def _bounded_browser_images_payload(parsed_result: dict[str, Any]) -> tuple[dict
         if not isinstance(image, dict):
             continue
         src = image.get("src")
-        safe_src = _safe_browser_output_reference(src)
+        safe_src = _safe_tool_output_reference(src)
         if safe_src and len(output_references) < _BROWSER_OUTPUT_REFERENCE_LIMIT:
             output_references.append(safe_src)
         bounded: dict[str, Any] = {
@@ -972,6 +977,66 @@ def _browser_tool_output_overrides(tool_name: str, parsed_result: Any) -> tuple[
     return None, []
 
 
+def _bounded_vision_analyze_payload(parsed_result: dict[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
+    analysis = "" if parsed_result.get("analysis") is None else str(parsed_result.get("analysis"))
+    payload: dict[str, Any] = {
+        "success": _tool_output_success(parsed_result),
+        "analysis_preview": analysis[:_MEDIA_ANALYSIS_PREVIEW_LIMIT],
+    }
+    if len(analysis) > _MEDIA_ANALYSIS_PREVIEW_LIMIT:
+        payload["analysis_truncated"] = True
+    if parsed_result.get("error"):
+        payload["error"] = str(parsed_result.get("error"))
+    output_references: list[str] = []
+    artifact_path = parsed_result.get("analysis_artifact_path")
+    if isinstance(artifact_path, str) and artifact_path:
+        safe_ref = _safe_tool_output_reference(artifact_path)
+        if safe_ref:
+            output_references.append(safe_ref)
+    artifact_ids: list[str] = []
+    artifact_id = parsed_result.get("artifact_id")
+    if isinstance(artifact_id, str) and artifact_id.startswith("artifact_"):
+        artifact_ids.append(artifact_id)
+    return payload, output_references, artifact_ids
+
+
+def _bounded_text_to_speech_payload(parsed_result: dict[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
+    payload: dict[str, Any] = {
+        "success": _tool_output_success(parsed_result),
+    }
+    if parsed_result.get("provider"):
+        payload["provider"] = str(parsed_result.get("provider"))
+    if "voice_compatible" in parsed_result:
+        payload["voice_compatible"] = bool(parsed_result.get("voice_compatible"))
+    output_references: list[str] = []
+    file_path = parsed_result.get("file_path")
+    if isinstance(file_path, str) and file_path:
+        safe_ref = _safe_tool_output_reference(file_path)
+        if safe_ref:
+            payload["file_path"] = safe_ref
+            output_references.append(safe_ref)
+    artifact_ids: list[str] = []
+    artifact_id = parsed_result.get("artifact_id")
+    if isinstance(artifact_id, str) and artifact_id.startswith("artifact_"):
+        artifact_ids.append(artifact_id)
+    if parsed_result.get("error"):
+        payload["error"] = str(parsed_result.get("error"))
+    return payload, output_references, artifact_ids
+
+
+def _media_tool_output_overrides(
+    tool_name: str,
+    parsed_result: Any,
+) -> tuple[dict[str, Any] | None, list[str], list[str]]:
+    if not isinstance(parsed_result, dict):
+        return None, [], []
+    if tool_name == "vision_analyze":
+        return _bounded_vision_analyze_payload(parsed_result)
+    if tool_name == "text_to_speech":
+        return _bounded_text_to_speech_payload(parsed_result)
+    return None, [], []
+
+
 def _wrap_tool_result_for_model_context(function_name: str, result: Any) -> Any:
     """Return a low-risk ToolOutputPacket envelope for model-visible output.
 
@@ -996,6 +1061,10 @@ def _wrap_tool_result_for_model_context(function_name: str, result: Any) -> Any:
     if adapter.tool_class not in _TOOL_OUTPUT_PACKET_CLASSES:
         return result
     if adapter.tool_class == "browser" and function_name not in {"browser_console", "browser_get_images"}:
+        return result
+    if adapter.tool_class == "image" and function_name not in {"vision_analyze"}:
+        return result
+    if adapter.tool_class == "tts" and function_name not in {"text_to_speech"}:
         return result
 
     sanitized_result = sanitize_tool_result_for_model(function_name, result)
@@ -1029,6 +1098,13 @@ def _wrap_tool_result_for_model_context(function_name: str, result: Any) -> Any:
         return adapter.render_output(packet)
 
     bounded_payload_override, output_references_override = _browser_tool_output_overrides(function_name, parsed_result)
+    media_payload_override, media_output_references, media_artifact_ids = _media_tool_output_overrides(
+        function_name,
+        parsed_result,
+    )
+    if media_payload_override is not None:
+        bounded_payload_override = media_payload_override
+        output_references_override = media_output_references
     bounded_payload = bounded_payload_override if bounded_payload_override is not None else (
         parsed_result if isinstance(parsed_result, dict) else {"value": parsed_result}
     )
@@ -1037,6 +1113,7 @@ def _wrap_tool_result_for_model_context(function_name: str, result: Any) -> Any:
         tool_class=adapter.tool_class,
         success=_tool_output_success(parsed_result),
         summary=_tool_output_summary(function_name, adapter.tool_class, parsed_result),
+        artifact_ids=media_artifact_ids,
         output_references=output_references_override,
         bounded_payload=bounded_payload,
     )

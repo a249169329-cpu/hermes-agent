@@ -39,6 +39,7 @@ from urllib.parse import urlparse
 import httpx
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 from hermes_constants import get_hermes_dir
+from tools.artifact_ledger import record_tool_artifact
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
 import sys
@@ -798,6 +799,58 @@ async def _vision_analyze_native(
                 pass
 
 
+def _bounded_vision_source_reference(image_url: str) -> str:
+    value = str(image_url or "")
+    lowered = value.strip().lower()
+    if lowered.startswith("data:"):
+        return "[omitted:data_uri_image]"
+    return value[:2048]
+
+
+def _record_vision_analysis_artifact(
+    *,
+    image_url: str,
+    user_prompt: str,
+    model: str | None,
+    analysis: str,
+) -> tuple[str | None, str | None]:
+    """Persist bounded vision-analysis text as an artifact, never raw image bytes."""
+    if not isinstance(analysis, str) or not analysis.strip():
+        return None, None
+    try:
+        artifacts_dir = get_hermes_dir("artifacts/vision", "vision_artifacts")
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        output_path = artifacts_dir / f"vision_analysis_{uuid.uuid4().hex}.json"
+        source_image_reference = _bounded_vision_source_reference(image_url)
+        output_path.write_text(
+            json.dumps(
+                {
+                    "analysis": analysis,
+                    "source_image_reference": source_image_reference,
+                    "model": model or "",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        artifact_id = record_tool_artifact(
+            source_tool="vision_analyze",
+            native_arguments={
+                "image_url": source_image_reference,
+                "question": str(user_prompt)[:2048],
+                "model": model or "",
+            },
+            output_reference=str(output_path),
+            kind="vision_analysis",
+            lifetime="persistent_or_remote",
+        )
+        return artifact_id, str(output_path)
+    except Exception as exc:  # noqa: BLE001 - ledger failure must not break vision
+        logger.warning("Could not record vision analysis artifact: %s", exc)
+        return None, None
+
+
 async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
@@ -1006,10 +1059,21 @@ async def vision_analyze_tool(
         logger.info("Image analysis completed (%s characters)", analysis_length)
         
         # Prepare successful response
+        final_analysis = analysis or "There was a problem with the request and the image could not be analyzed."
         result = {
             "success": True,
-            "analysis": analysis or "There was a problem with the request and the image could not be analyzed."
+            "analysis": final_analysis,
         }
+        artifact_id, analysis_artifact_path = _record_vision_analysis_artifact(
+            image_url=image_url,
+            user_prompt=user_prompt,
+            model=model,
+            analysis=final_analysis,
+        )
+        if artifact_id:
+            result["artifact_id"] = artifact_id
+        if analysis_artifact_path:
+            result["analysis_artifact_path"] = analysis_artifact_path
         
         debug_call_data["success"] = True
         debug_call_data["analysis_length"] = analysis_length
