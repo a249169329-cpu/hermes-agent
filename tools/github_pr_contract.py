@@ -10,7 +10,9 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 
+from tools.artifact_ledger import record_tool_artifact
 from tools.tool_input_packet import HERMES_OR_SESSION_MARKERS, PacketLimits, validate_text_packet
+from tools.tool_output_packet import ToolOutputPacket
 
 
 class GitHubOperationKind(StrEnum):
@@ -174,3 +176,89 @@ def render_gh_command(
     if operation == GitHubOperationKind.RELEASE_CREATE:
         return ["gh", "release", "create", contract.title or "", *repo_args, "--notes", contract.body or ""]
     raise ValueError(f"unsupported_github_operation: {operation}")
+
+
+def _github_artifact_kind(operation: GitHubOperationKind) -> str:
+    if operation in {GitHubOperationKind.PR_VIEW, GitHubOperationKind.PR_CREATE, GitHubOperationKind.PR_COMMENT, GitHubOperationKind.PR_REVIEW, GitHubOperationKind.PR_MERGE}:
+        return "github_pr"
+    if operation in {GitHubOperationKind.ISSUE_VIEW, GitHubOperationKind.ISSUE_COMMENT}:
+        return "github_issue"
+    if operation == GitHubOperationKind.RELEASE_CREATE:
+        return "github_release"
+    return "github_operation"
+
+
+def build_github_operation_output_packet(
+    contract: GitHubOperationContract,
+    *,
+    success: bool,
+    html_url: str | None = None,
+    number: int | None = None,
+    node_id: str | None = None,
+    warnings: list[str] | None = None,
+) -> ToolOutputPacket:
+    """Build a bounded model-visible result packet for a GitHub operation.
+
+    The packet carries verification handles (URL/number/repo) and governance
+    metadata, never raw GitHub API responses, full PR bodies, or tokens.
+    """
+    operation = GitHubOperationKind(contract.operation)
+    effective_number = number or contract.pr_number or contract.issue_number
+    bounded_payload = {
+        "repo": contract.repo,
+        "operation": operation.value,
+    }
+    if effective_number is not None:
+        bounded_payload["number"] = effective_number
+    if html_url:
+        bounded_payload["html_url"] = html_url
+    metadata = {
+        "repo": contract.repo,
+        "operation": operation.value,
+        "side_effect_class": side_effect_class_for_operation(operation),
+    }
+    if effective_number is not None:
+        metadata["number"] = effective_number
+    if node_id:
+        metadata["node_id"] = node_id
+    refs = [html_url] if html_url else []
+    return ToolOutputPacket(
+        tool_name="github_pr_contract",
+        tool_class="github",
+        success=bool(success),
+        summary=f"GitHub {operation.value} {'succeeded' if success else 'failed'} for {contract.repo}.",
+        output_references=refs,
+        bounded_payload=bounded_payload,
+        provider_metadata_summary=metadata,
+        warnings=list(warnings or []),
+    )
+
+
+def record_github_operation_artifact(
+    contract: GitHubOperationContract,
+    *,
+    output_url: str,
+    number: int | None = None,
+    ledger_path=None,
+) -> str | None:
+    """Record a GitHub URL as a remote artifact verification handle."""
+    operation = GitHubOperationKind(contract.operation)
+    native_arguments = {
+        "repo": contract.repo,
+        "operation": operation.value,
+    }
+    effective_number = number or contract.pr_number or contract.issue_number
+    if effective_number is not None:
+        native_arguments["number"] = effective_number
+    if contract.head_branch:
+        native_arguments["head_branch"] = contract.head_branch
+    if contract.base_branch:
+        native_arguments["base_branch"] = contract.base_branch
+    return record_tool_artifact(
+        source_tool="github_pr_contract",
+        native_arguments=native_arguments,
+        output_reference=output_url,
+        kind=_github_artifact_kind(operation),
+        lifetime="persistent_or_remote",
+        ledger_path=ledger_path,
+    )

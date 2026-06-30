@@ -1,6 +1,8 @@
 from tools.github_pr_contract import (
     GitHubOperationContract,
     GitHubOperationKind,
+    build_github_operation_output_packet,
+    record_github_operation_artifact,
     render_gh_command,
     side_effect_class_for_operation,
     validate_github_operation_contract,
@@ -163,3 +165,64 @@ def test_render_gh_command_for_pr_create_uses_explicit_branches_and_body():
         "--body",
         "Bounded PR body.",
     ]
+
+
+def test_github_pr_create_result_builds_bounded_tool_output_packet():
+    contract = GitHubOperationContract(
+        operation=GitHubOperationKind.PR_CREATE,
+        repo="NousResearch/hermes-agent",
+        head_branch="feature/tool-contracts",
+        base_branch="main",
+        title="Add tool contracts",
+        body="Bounded PR body.",
+    )
+
+    packet = build_github_operation_output_packet(
+        contract,
+        success=True,
+        html_url="https://github.com/NousResearch/hermes-agent/pull/123",
+        number=123,
+        node_id="PR_kwDOexample",
+    )
+
+    assert packet.tool_name == "github_pr_contract"
+    assert packet.tool_class == "github"
+    assert packet.success is True
+    assert packet.output_references == ["https://github.com/NousResearch/hermes-agent/pull/123"]
+    assert packet.provider_metadata_summary == {
+        "repo": "NousResearch/hermes-agent",
+        "operation": "pr_create",
+        "side_effect_class": "external_pr_write",
+        "number": 123,
+        "node_id": "PR_kwDOexample",
+    }
+    assert packet.bounded_payload == {
+        "repo": "NousResearch/hermes-agent",
+        "operation": "pr_create",
+        "number": 123,
+        "html_url": "https://github.com/NousResearch/hermes-agent/pull/123",
+    }
+
+
+def test_github_pr_create_result_records_artifact_ledger_reference(tmp_path):
+    contract = GitHubOperationContract(
+        operation=GitHubOperationKind.PR_CREATE,
+        repo="NousResearch/hermes-agent",
+        head_branch="feature/tool-contracts",
+        base_branch="main",
+        title="Add tool contracts",
+        body="Bounded PR body.",
+    )
+
+    artifact_id = record_github_operation_artifact(
+        contract,
+        output_url="https://github.com/NousResearch/hermes-agent/pull/123",
+        number=123,
+        ledger_path=tmp_path / "ledger.jsonl",
+    )
+
+    assert artifact_id is not None
+    lines = (tmp_path / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert "github_pr" in lines[0]
+    assert "https://github.com/NousResearch/hermes-agent/pull/123" in lines[0]
