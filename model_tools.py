@@ -822,7 +822,11 @@ def _tool_result_observer_fields(result: Any) -> tuple[str, Optional[str], Optio
     return "ok", None, None
 
 
-_TOOL_OUTPUT_PACKET_CLASSES = {"web", "mcp"}
+_TOOL_OUTPUT_PACKET_CLASSES = {"web", "mcp", "browser"}
+
+_BROWSER_CONSOLE_TEXT_LIMIT = 512
+_BROWSER_OUTPUT_ITEM_LIMIT = 50
+_BROWSER_OUTPUT_REFERENCE_LIMIT = 20
 
 
 def _parse_jsonish_tool_result(result: Any) -> Any:
@@ -846,6 +850,13 @@ def _tool_output_success(parsed_result: Any) -> bool:
     return True
 
 
+def _bounded_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _tool_output_summary(tool_name: str, tool_class: str, parsed_result: Any) -> str:
     if isinstance(parsed_result, dict) and parsed_result.get("error"):
         return f"{tool_name} returned an error"
@@ -854,17 +865,120 @@ def _tool_output_summary(tool_name: str, tool_class: str, parsed_result: Any) ->
         web_items = data.get("web") if isinstance(data, dict) else None
         if isinstance(web_items, list):
             return f"{tool_name} returned {len(web_items)} web result(s)"
+    if tool_class == "browser" and isinstance(parsed_result, dict):
+        if tool_name == "browser_console":
+            return (
+                f"browser_console returned {_bounded_int(parsed_result.get('total_messages'))} "
+                f"console message(s), {_bounded_int(parsed_result.get('total_errors'))} JS error(s)"
+            )
+        if tool_name == "browser_get_images":
+            return f"browser_get_images returned {_bounded_int(parsed_result.get('count'))} image reference(s)"
     if tool_class == "mcp":
         return f"{tool_name} returned MCP tool output"
     return f"{tool_name} returned {tool_class} tool output"
 
 
+def _truncate_browser_text(value: Any, *, limit: int = _BROWSER_CONSOLE_TEXT_LIMIT) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit]
+
+
+def _bounded_browser_console_payload(parsed_result: dict[str, Any]) -> dict[str, Any]:
+    messages: list[dict[str, Any]] = []
+    for msg in (parsed_result.get("console_messages") or [])[:_BROWSER_OUTPUT_ITEM_LIMIT]:
+        if not isinstance(msg, dict):
+            continue
+        raw_text = "" if msg.get("text") is None else str(msg.get("text"))
+        bounded: dict[str, Any] = {
+            "type": str(msg.get("type") or "log"),
+            "text": _truncate_browser_text(raw_text),
+            "source": str(msg.get("source") or "console"),
+        }
+        if len(raw_text) > _BROWSER_CONSOLE_TEXT_LIMIT:
+            bounded["truncated"] = True
+        messages.append(bounded)
+
+    errors: list[dict[str, Any]] = []
+    for err in (parsed_result.get("js_errors") or [])[:_BROWSER_OUTPUT_ITEM_LIMIT]:
+        if not isinstance(err, dict):
+            continue
+        raw_message = "" if err.get("message") is None else str(err.get("message"))
+        bounded = {
+            "message": _truncate_browser_text(raw_message),
+            "source": str(err.get("source") or "exception"),
+        }
+        if len(raw_message) > _BROWSER_CONSOLE_TEXT_LIMIT:
+            bounded["truncated"] = True
+        errors.append(bounded)
+
+    payload = {
+        "success": _tool_output_success(parsed_result),
+        "total_messages": _bounded_int(parsed_result.get("total_messages"), len(messages)),
+        "total_errors": _bounded_int(parsed_result.get("total_errors"), len(errors)),
+        "console_messages": messages,
+        "js_errors": errors,
+    }
+    return payload
+
+
+def _safe_browser_output_reference(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        from tools.artifact_ledger import validate_artifact_output_reference
+    except Exception:
+        return None
+    candidate = value.strip()
+    if validate_artifact_output_reference(candidate):
+        return None
+    return candidate
+
+
+def _bounded_browser_images_payload(parsed_result: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    images: list[dict[str, Any]] = []
+    output_references: list[str] = []
+    for image in (parsed_result.get("images") or [])[:_BROWSER_OUTPUT_ITEM_LIMIT]:
+        if not isinstance(image, dict):
+            continue
+        src = image.get("src")
+        safe_src = _safe_browser_output_reference(src)
+        if safe_src and len(output_references) < _BROWSER_OUTPUT_REFERENCE_LIMIT:
+            output_references.append(safe_src)
+        bounded: dict[str, Any] = {
+            "src": safe_src or "[omitted unsafe image reference]",
+            "alt": _truncate_browser_text(image.get("alt") or "", limit=256),
+        }
+        for key in ("width", "height"):
+            if key in image:
+                bounded[key] = image.get(key)
+        images.append(bounded)
+    payload = {
+        "success": _tool_output_success(parsed_result),
+        "count": _bounded_int(parsed_result.get("count"), len(images)),
+        "images": images,
+    }
+    return payload, output_references
+
+
+def _browser_tool_output_overrides(tool_name: str, parsed_result: Any) -> tuple[dict[str, Any] | None, list[str]]:
+    if not isinstance(parsed_result, dict):
+        return None, []
+    if tool_name == "browser_console":
+        return _bounded_browser_console_payload(parsed_result), []
+    if tool_name == "browser_get_images":
+        return _bounded_browser_images_payload(parsed_result)
+    return None, []
+
+
 def _wrap_tool_result_for_model_context(function_name: str, result: Any) -> Any:
     """Return a low-risk ToolOutputPacket envelope for model-visible output.
 
-    This is intentionally narrow: only web/search and MCP-style tools are
-    wrapped in this slice. High-risk artifact-producing or mutating tools keep
-    their existing return paths until their class adapters have dedicated live
+    This remains intentionally narrow: web/search, MCP-style tools, and the
+    browser console/image-reference readouts are wrapped in this slice. Other
+    browser tools (notably snapshots and navigation/interaction state changes)
+    keep their existing return paths until their contracts have dedicated live
     integration tests.
     """
     entry = registry.get_entry(function_name)
@@ -880,6 +994,8 @@ def _wrap_tool_result_for_model_context(function_name: str, result: Any) -> Any:
 
     adapter = resolve_tool_class_adapter(entry)
     if adapter.tool_class not in _TOOL_OUTPUT_PACKET_CLASSES:
+        return result
+    if adapter.tool_class == "browser" and function_name not in {"browser_console", "browser_get_images"}:
         return result
 
     sanitized_result = sanitize_tool_result_for_model(function_name, result)
@@ -912,12 +1028,16 @@ def _wrap_tool_result_for_model_context(function_name: str, result: Any) -> Any:
             )
         return adapter.render_output(packet)
 
-    bounded_payload = parsed_result if isinstance(parsed_result, dict) else {"value": parsed_result}
+    bounded_payload_override, output_references_override = _browser_tool_output_overrides(function_name, parsed_result)
+    bounded_payload = bounded_payload_override if bounded_payload_override is not None else (
+        parsed_result if isinstance(parsed_result, dict) else {"value": parsed_result}
+    )
     packet = ToolOutputPacket(
         tool_name=function_name,
         tool_class=adapter.tool_class,
         success=_tool_output_success(parsed_result),
         summary=_tool_output_summary(function_name, adapter.tool_class, parsed_result),
+        output_references=output_references_override,
         bounded_payload=bounded_payload,
     )
     violations = validate_tool_output_packet(packet, limits=output_limits)
