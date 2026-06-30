@@ -118,6 +118,74 @@ class TestAgentSessionSplitPersistence:
         )
         assert "final answer after compression" in contents
 
+    def test_compression_split_copies_gateway_scope_to_child_session(self, tmp_path):
+        """Compression children must keep QQ/gateway scope for recall isolation."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db.create_session(
+            "original-session",
+            source="qqbot",
+            user_id="qq-a",
+            chat_type="dm",
+            chat_id="qq-a",
+            session_key="agent:main:qqbot:dm:qq-a",
+        )
+
+        agent = SimpleNamespace(
+            _compression_feasibility_checked=True,
+            session_id="original-session",
+            model="test/model",
+            platform="qqbot",
+            _session_db=db,
+            _session_db_created=True,
+            _session_init_model_config={},
+            _user_id="qq-a",
+            _user_id_alt="qq-alt-a",
+            _chat_type="dm",
+            _chat_id="qq-a",
+            _thread_id=None,
+            _gateway_session_key="agent:main:qqbot:dm:qq-a",
+            _memory_manager=None,
+            _last_flushed_db_idx=5,
+            tools=[],
+            context_compressor=SimpleNamespace(
+                _last_compress_aborted=False,
+                _last_summary_error=None,
+                compression_count=1,
+                compress=lambda *a, **k: [{"role": "user", "content": "compressed"}],
+            ),
+            _todo_store=SimpleNamespace(format_for_injection=lambda: ""),
+            _emit_status=lambda *a, **k: None,
+            _emit_warning=lambda *a, **k: None,
+            _vprint=lambda *a, **k: None,
+            _invalidate_system_prompt=lambda: None,
+            _build_system_prompt=lambda system_message: "new system prompt",
+            _cached_system_prompt="old system prompt",
+            commit_memory_session=lambda messages: None,
+        )
+        db.try_acquire_compression_lock = lambda *a, **k: True
+        db.release_compression_lock = lambda *a, **k: None
+
+        compressed, new_prompt = compress_context(
+            agent,
+            [{"role": "user", "content": "hello"}],
+            "system",
+        )
+
+        assert compressed == [{"role": "user", "content": "compressed"}]
+        assert new_prompt == "new system prompt"
+        child = db.get_session(agent.session_id)
+        assert child["parent_session_id"] == "original-session"
+        assert child["source"] == "qqbot"
+        assert child["user_id"] == "qq-a"
+        assert child["user_id_alt"] == "qq-alt-a"
+        assert child["chat_type"] == "dm"
+        assert child["chat_id"] == "qq-a"
+        assert child["thread_id"] is None
+        assert child["session_key"] == "agent:main:qqbot:dm:qq-a"
+
 
 def test_gateway_history_offset_resets_when_session_split():
     from gateway.run import _history_offset_for_session_split

@@ -118,17 +118,81 @@ def _session_matches_current_scope(session_meta: Dict[str, Any], current_scope: 
     return True
 
 
-def _session_is_legacy_scope_candidate(session_meta: Dict[str, Any], current_scope: Dict[str, str]) -> bool:
-    """Narrow legacy fallback for rows that predate persisted chat scope fields."""
+def _legacy_user_identity_matches(session_meta: Dict[str, Any], current_scope: Dict[str, str]) -> bool:
+    """Return True only when legacy rows have an explicit matching user id."""
+    row_ids = {
+        _clean(session_meta.get("user_id")),
+        _clean(session_meta.get("user_id_alt")),
+    } - {""}
+    cur_ids = {
+        current_scope.get("user_id") or "",
+        current_scope.get("user_id_alt") or "",
+    } - {""}
+    return bool(row_ids and cur_ids and row_ids.intersection(cur_ids))
+
+
+def _session_is_legacy_scope_candidate(db, session_meta: Dict[str, Any], current_scope: Dict[str, str]) -> bool:
+    """Narrow legacy fallback for rows that predate persisted chat scope fields.
+
+    Older gateway rows sometimes lack chat_id/session_key, so strict chat-scope
+    matching cannot use them directly.  Only accept such rows when they carry a
+    concrete matching user identity, or when they are a historical compression
+    child whose ancestor row has the current chat scope.  Never treat a blank
+    QQBot row as matching every QQ chat.
+    """
     if not session_meta:
         return False
     if _clean(session_meta.get("source")).lower() != (current_scope.get("source") or ""):
         return False
     if _clean(session_meta.get("chat_id")) or _clean(session_meta.get("thread_id")) or _clean(session_meta.get("session_key")):
         return False
-    row_user = _clean(session_meta.get("user_id"))
-    cur_user = current_scope.get("user_id") or current_scope.get("user_id_alt")
-    return not row_user or not cur_user or row_user == cur_user
+
+    row_ids = {
+        _clean(session_meta.get("user_id")),
+        _clean(session_meta.get("user_id_alt")),
+    } - {""}
+    cur_ids = {
+        current_scope.get("user_id") or "",
+        current_scope.get("user_id_alt") or "",
+    } - {""}
+    if row_ids:
+        return bool(cur_ids and row_ids.intersection(cur_ids))
+
+    # Historical compression continuation rows were created without copied
+    # gateway scope, but they keep parent_session_id.  Allow them only when an
+    # ancestor belongs to the current chat/user scope.
+    parent_id = _clean(session_meta.get("parent_session_id"))
+    if not parent_id or db is None:
+        return False
+    seen = set()
+    current = parent_id
+    while current and current not in seen:
+        seen.add(current)
+        try:
+            parent = db.get_session(current) or {}
+        except Exception:
+            parent = {}
+        if not parent:
+            return False
+        if _clean(parent.get("source")).lower() != (current_scope.get("source") or ""):
+            return False
+        if _session_matches_current_scope(parent, current_scope):
+            return True
+        parent_has_scope = bool(
+            _clean(parent.get("chat_id"))
+            or _clean(parent.get("thread_id"))
+            or _clean(parent.get("session_key"))
+        )
+        if parent_has_scope:
+            # A concrete scoped ancestor for a different chat/user is an
+            # explicit boundary. Do not skip past it to find an older matching
+            # root, or an out-of-scope compression branch could inherit trust
+            # from a grandparent that no longer represents the child lineage.
+            return False
+        if _legacy_user_identity_matches(parent, current_scope):
+            return True
+        current = _clean(parent.get("parent_session_id"))
+    return False
 
 
 def _filter_sessions_for_scope(
@@ -156,7 +220,7 @@ def _filter_sessions_for_scope(
         if apply_scope:
             if _session_matches_current_scope(meta, current_scope):
                 filtered.append(row)
-            elif include_legacy and _session_is_legacy_scope_candidate(meta, current_scope):
+            elif include_legacy and _session_is_legacy_scope_candidate(db, meta, current_scope):
                 legacy_row = dict(row)
                 legacy_row["legacy_scope_fallback"] = True
                 filtered.append(legacy_row)
@@ -493,6 +557,9 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    *,
+    current_scope: Optional[Dict[str, str]] = None,
+    apply_scope: bool = False,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -536,6 +603,12 @@ def _scroll(
         session_meta = {}
     if not session_meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
+    current_scope = current_scope or {}
+    if apply_scope and not (
+        _session_matches_current_scope(session_meta, current_scope)
+        or _session_is_legacy_scope_candidate(db, session_meta, current_scope)
+    ):
+        return tool_error("scroll rejected: session_id is outside the current chat scope", success=False)
 
     # Fetch the window
     try:
@@ -589,6 +662,12 @@ def _scroll(
             f"around_message_id {around_message_id} not in session_id {session_id}",
             success=False,
         )
+
+    if apply_scope and not (
+        _session_matches_current_scope(session_meta, current_scope)
+        or _session_is_legacy_scope_candidate(db, session_meta, current_scope)
+    ):
+        return tool_error("scroll rejected: anchor session is outside the current chat scope", success=False)
 
     response = {
         "success": True,
@@ -668,7 +747,7 @@ def _discover(
                 meta = db.get_session(raw_sid) or {}
             except Exception:
                 meta = {}
-            legacy_match = _session_is_legacy_scope_candidate(meta, current_scope)
+            legacy_match = _session_is_legacy_scope_candidate(db, meta, current_scope)
             if not _session_matches_current_scope(meta, current_scope) and not legacy_match:
                 continue
         else:
@@ -940,6 +1019,8 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            current_scope=current_scope,
+            apply_scope=apply_scope,
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.

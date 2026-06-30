@@ -362,6 +362,150 @@ class TestScopedGatewayRecall:
         assert result["results"][0].get("legacy_scope_fallback") is True
         assert "legacy_telegram" not in json.dumps(result, ensure_ascii=False)
 
+    def test_handoff_legacy_fallback_requires_user_identity(self, db):
+        """Unscoped old QQ rows must not be visible to every QQBot chat."""
+        now = time.time()
+        db.create_session("unscoped_qq", source="qqbot")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (now - 50, now - 10, "unscoped_qq"),
+        )
+        db.append_message("unscoped_qq", role="user", content="private old qq topic")
+        db.create_session("a_current", source="qqbot", user_id="qq-a", chat_type="dm", chat_id="qq-a")
+
+        result = json.loads(session_search(
+            mode="previous",
+            db=db,
+            current_session_id="a_current",
+            current_source="qqbot",
+            current_chat_type="dm",
+            current_chat_id="qq-a",
+            current_user_id="qq-a",
+        ))
+
+        assert result["success"] is True
+        assert result["results"] == []
+        assert "private old qq topic" not in json.dumps(result, ensure_ascii=False)
+
+    def test_discovery_legacy_fallback_requires_user_identity(self, db):
+        """Keyword search must not leak unscoped QQ legacy rows into another QQ chat."""
+        db.create_session("unscoped_qq", source="qqbot")
+        db.append_message("unscoped_qq", role="user", content="串会话 sentinel")
+        db.create_session("a_current", source="qqbot", user_id="qq-a", chat_type="dm", chat_id="qq-a")
+
+        result = json.loads(session_search(
+            query="串会话 sentinel",
+            db=db,
+            current_session_id="a_current",
+            current_source="qqbot",
+            current_chat_type="dm",
+            current_chat_id="qq-a",
+            current_user_id="qq-a",
+        ))
+
+        assert result["success"] is True
+        assert result["results"] == []
+
+    def test_discovery_legacy_compression_child_can_match_scoped_parent(self, db):
+        """Old compression children without copied scope still belong to their scoped parent chat."""
+        now = time.time()
+        db.create_session(
+            "root_qq",
+            source="qqbot",
+            user_id="qq-a",
+            chat_type="dm",
+            chat_id="qq-a",
+            session_key="agent:main:qqbot:dm:qq-a",
+        )
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = ? WHERE id = ?",
+            (now - 100, now - 50, "compression", "root_qq"),
+        )
+        db.create_session("child_unscoped", source="qqbot", parent_session_id="root_qq")
+        db.append_message("child_unscoped", role="user", content="compressed child sentinel")
+        db.create_session("a_current", source="qqbot", user_id="qq-a", chat_type="dm", chat_id="qq-a")
+
+        result = json.loads(session_search(
+            query="compressed child sentinel",
+            db=db,
+            current_session_id="a_current",
+            current_source="qqbot",
+            current_chat_type="dm",
+            current_chat_id="qq-a",
+            current_user_id="qq-a",
+        ))
+
+        assert result["success"] is True
+        assert [hit["session_id"] for hit in result["results"]] == ["child_unscoped"]
+        assert result["results"][0].get("legacy_scope_fallback") is True
+
+    def test_discovery_legacy_compression_child_stops_at_mismatched_scoped_ancestor(self, db):
+        """A mismatched scoped ancestor must not be skipped to find an older matching root."""
+        now = time.time()
+        db.create_session(
+            "root_a",
+            source="qqbot",
+            user_id="qq-a",
+            chat_type="dm",
+            chat_id="qq-a",
+            session_key="agent:main:qqbot:dm:qq-a",
+        )
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = ? WHERE id = ?",
+            (now - 200, now - 150, "compression", "root_a"),
+        )
+        db.create_session(
+            "mid_b",
+            source="qqbot",
+            user_id="qq-b",
+            chat_type="dm",
+            chat_id="qq-b",
+            session_key="agent:main:qqbot:dm:qq-b",
+            parent_session_id="root_a",
+        )
+        db.create_session("child_unscoped", source="qqbot", parent_session_id="mid_b")
+        db.append_message("child_unscoped", role="user", content="mismatched scoped ancestor sentinel")
+        db.create_session("a_current", source="qqbot", user_id="qq-a", chat_type="dm", chat_id="qq-a")
+
+        result = json.loads(session_search(
+            query="mismatched scoped ancestor sentinel",
+            db=db,
+            current_session_id="a_current",
+            current_source="qqbot",
+            current_chat_type="dm",
+            current_chat_id="qq-a",
+            current_user_id="qq-a",
+        ))
+
+        assert result["success"] is True
+        assert result["results"] == []
+        assert "mismatched scoped ancestor sentinel" not in json.dumps(result["results"], ensure_ascii=False)
+
+    def test_scroll_rejects_out_of_scope_qqbot_anchor(self, db):
+        """Scroll must not bypass the current QQ chat scope with explicit ids."""
+        db.create_session("b_old", source="qqbot", user_id="qq-b", chat_type="dm", chat_id="qq-b")
+        db.append_message("b_old", role="user", content="b private scroll sentinel")
+        msg_id = db._conn.execute(
+            "SELECT id FROM messages WHERE session_id = ? LIMIT 1",
+            ("b_old",),
+        ).fetchone()[0]
+        db.create_session("a_current", source="qqbot", user_id="qq-a", chat_type="dm", chat_id="qq-a")
+
+        result = json.loads(session_search(
+            session_id="b_old",
+            around_message_id=msg_id,
+            db=db,
+            current_session_id="a_current",
+            current_source="qqbot",
+            current_chat_type="dm",
+            current_chat_id="qq-a",
+            current_user_id="qq-a",
+        ))
+
+        assert result["success"] is False
+        assert "scope" in result["error"]
+        assert "b private scroll sentinel" not in json.dumps(result, ensure_ascii=False)
+
     def test_cli_search_remains_broad_by_default(self, db):
         self._create_scoped_session(db, "qq_old", chat_id="qq-a", user_id="qq-a", text="modpack qq")
         db.create_session("cli_old", source="cli")
